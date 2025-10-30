@@ -25,10 +25,12 @@
 This document outlines a phased approach to implementing Niyanta, a distributed workload processing system. The plan is structured to deliver incremental value while managing technical risk.
 
 ### Key Objectives
-1. Deliver a working MVP in 8-10 weeks
-2. Achieve production-readiness in 16-20 weeks
+1. Deliver a working MVP in 8-10 weeks **with affinity support**
+2. Achieve production-readiness in 16-20 weeks **with auto-scaling**
 3. Support 100+ concurrent workloads with < 99.5% uptime by Phase 2
-4. Scale to 1000+ concurrent workloads with 99.9% uptime by Phase 4
+4. **Scale to 10,000 concurrent workloads** with 99.9% uptime by Phase 4
+5. **Support affinity-based workload placement** (GPU, region, compliance) from Phase 1
+6. **Implement SLA-based priority scheduling** with starvation prevention by Phase 2
 
 ### Phases Overview
 
@@ -60,32 +62,37 @@ This document outlines a phased approach to implementing Niyanta, a distributed 
 
 ---
 
-### Phase 1: MVP - Core Functionality
-**Goal**: Build minimal viable product with core workload execution capability
+### Phase 1: MVP - Core Functionality with Affinity Support
+**Goal**: Build minimal viable product with core workload execution and affinity-based placement
 
 **Duration**: 6-8 weeks
 
 **Key Deliverables**:
-- ✅ Single-instance coordinator with basic REST API
+- ✅ Single-instance coordinator with basic REST API **and backpressure**
 - ✅ Worker registration and heartbeat mechanism
-- ✅ Simple FIFO scheduler (no affinity, basic priority)
+- ✅ **FIFO scheduler with full affinity support** (hard, soft, anti-affinity)
 - ✅ Workload execution framework with 1 sample workload type
 - ✅ Basic checkpoint and recovery (manual checkpoint only)
-- ✅ PostgreSQL state storage
+- ✅ PostgreSQL state storage **with connection pooling and query optimization**
 - ✅ NATS broker integration
 - ✅ Health and metrics endpoints
+- ✅ **AffinityEvaluator for GPU, region, and compliance requirements**
 
 **Success Criteria**:
 - Submit a workload via API and execute successfully
 - Worker failure triggers redistribution within 2 minutes
 - Workload can checkpoint and resume on different worker
+- **GPU workloads are placed only on GPU workers** (hard affinity)
+- **Workloads prefer workers in same region** (soft affinity)
+- **Conflicting workloads avoid co-location** (anti-affinity)
+- **System handles 100+ concurrent workloads efficiently**
 
 ---
 
-### Phase 2: Production Hardening
-**Goal**: Make system production-ready with HA, observability, and robust error handling
+### Phase 2: Production Hardening with Scale and Priority
+**Goal**: Make system production-ready with HA, observability, auto-scaling, and SLA-based scheduling
 
-**Duration**: 8-10 weeks
+**Duration**: 10-12 weeks *(extended for priority and auto-scaling)*
 
 **Key Deliverables**:
 - ✅ HA coordinator with leader election
@@ -95,39 +102,47 @@ This document outlines a phased approach to implementing Niyanta, a distributed 
 - ✅ Multi-customer support with API key authentication
 - ✅ Rate limiting per customer tier
 - ✅ Audit event logging
-- ✅ Deployment on Kubernetes
+- ✅ **Priority scheduler with SLA tier-based weighting** (Free=1, Standard=10, Premium=50, Enterprise=100)
+- ✅ **Priority aging to prevent starvation** (boost by 5 per minute)
+- ✅ **Auto-scaling integration with Kubernetes HPA and EC2 ASG**
+- ✅ **Custom metrics exporter** (queue depth, worker utilization)
+- ✅ **Database read replica support** for query offloading
+- ✅ Deployment on Kubernetes with HPA
 - ✅ Load testing and performance benchmarking
 - ✅ Runbooks and operational documentation
 
 **Success Criteria**:
-- System handles 100 concurrent workloads across 10 workers
+- System handles **1,000 concurrent workloads** across 50+ workers
 - 99.5% uptime over 2-week test period
 - Coordinator failover < 30 seconds
 - Worker failure detection < 60 seconds
-- API p95 latency < 200ms
+- API p95 latency < 100ms *(improved from 200ms)*
+- **Premium tier workloads scheduled before free tier** (SLA enforcement)
+- **No workload starves for > 30 minutes** (aging works)
+- **Auto-scaling responds within 5 minutes** to load increases
+- **Database handles 10,000 workload submissions/hour**
 
 ---
 
 ### Phase 3: Advanced Features
-**Goal**: Implement advanced scheduling, affinity, auto-scaling, and customer-facing features
+**Goal**: Implement advanced features, multi-region support, and customer-facing enhancements
 
 **Duration**: 6-8 weeks
 
 **Key Deliverables**:
-- ✅ Workload affinity (hard, soft, anti-affinity)
-- ✅ SLA-based priority scheduling
+- ✅ **Affinity tuning and optimization** *(core affinity already in Phase 1)*
 - ✅ Automatic checkpointing (time-based and progress-based)
-- ✅ Worker auto-scaling integration (Kubernetes HPA / EC2 ASG)
 - ✅ Workload pause/resume via API
 - ✅ WebSocket API for real-time updates
-- ✅ Multi-region preparation (data model, API design)
+- ✅ Multi-region preparation (data model, API design, region-aware scheduling)
 - ✅ Go and Python SDKs
 - ✅ Interactive API documentation (Swagger UI)
 
 **Success Criteria**:
-- Affinity rules correctly place 95% of workloads on preferred workers
-- Auto-scaling adds workers within 5 minutes of queue depth threshold
+- Affinity rules correctly place **99%** of workloads on preferred workers *(improved)*
+- **Complex affinity rules evaluate in < 100ms** (optimized)
 - SDK supports all core API operations
+- **Multi-region workloads prefer workers in same region as data**
 
 ---
 
@@ -292,62 +307,99 @@ This document outlines a phased approach to implementing Niyanta, a distributed 
 
 ---
 
-#### 1.2 Coordinator - API Server
+#### 1.2 Coordinator - API Server with Backpressure
 **Owner**: Backend Engineer
 **Duration**: 7 days
 
 **Tasks**:
 - [ ] Implement REST API handlers (using Gin or Echo framework):
-  - [ ] `POST /v1/workloads` - Submit workload
+  - [ ] `POST /v1/workloads` - Submit workload **with backpressure check**
   - [ ] `GET /v1/workloads/{id}` - Get workload status
   - [ ] `GET /v1/workloads` - List workloads
   - [ ] `POST /v1/workloads/{id}/cancel` - Cancel workload
+  - [ ] **[NEW]** `GET /v1/metrics/queue-depth` - Queue depth endpoint for monitoring
 - [ ] Implement API key authentication middleware
 - [ ] Add request validation (using validator library)
 - [ ] Implement error handling and standard error responses
 - [ ] Add request ID tracking for correlation
-- [ ] Write integration tests for API endpoints
+- [ ] **[CRITICAL]** Implement backpressure mechanism:
+  - [ ] Check queue depth before accepting workload submission
+  - [ ] Return HTTP 503 when at capacity with retry-after header
+  - [ ] Per-customer queue depth limits enforcement
+- [ ] Write integration tests for API endpoints including backpressure scenarios
 
-**Deliverable**: Functioning REST API for workload submission and querying
+**Deliverable**: Functioning REST API with backpressure to prevent overload
+
+**See Also**: [impl/10_API_HANDLERS.md](impl/10_API_HANDLERS.md) for complete implementation details
 
 ---
 
-#### 1.3 Coordinator - State Manager
+#### 1.3 Coordinator - State Manager with Connection Pooling
 **Owner**: Backend Engineer
-**Duration**: 5 days
+**Duration**: 6 days
 
 **Tasks**:
-- [ ] Implement database models (using sqlx or GORM)
+- [ ] Implement database models (using pgx/v5 for better performance)
+- [ ] **[CRITICAL]** Configure connection pooling for scale:
+  - [ ] MaxConnections: 20 (MVP), 100+ (production)
+  - [ ] MinConnections: 5
+  - [ ] MaxConnLifetime: 30 minutes
+  - [ ] MaxConnIdleTime: 5 minutes
+  - [ ] HealthCheckInterval: 1 minute
 - [ ] Create state manager interface and implementation:
   - [ ] `CreateWorkload()`
   - [ ] `GetWorkload()`
   - [ ] `UpdateWorkloadStatus()`
+  - [ ] `UpdateWorkloadStatusBatch()` - for batch updates
   - [ ] `ListWorkloads()`
-  - [ ] `GetPendingWorkloads()`
+  - [ ] `GetPendingWorkloads()` - with prepared statement and timeout
+  - [ ] **[NEW]** `GetWorkloadsByWorker()` - for anti-affinity checks
+  - [ ] **[NEW]** `GetQueueDepth()` - for monitoring and backpressure
+  - [ ] **[NEW]** `GetAvailableWorkers()` - with capacity filtering
 - [ ] Implement transaction wrappers for atomic operations
-- [ ] Add database connection retry logic
+- [ ] Add database connection retry logic with exponential backoff
+- [ ] **[CRITICAL]** Add query optimizations:
+  - [ ] Prepared statements for frequent queries
+  - [ ] Query timeouts (5s default)
+  - [ ] Connection context management
 - [ ] Write unit tests with mocked database
 - [ ] Write integration tests with test database
 
-**Deliverable**: State management layer for persisting workload data
+**Deliverable**: High-performance state management layer with connection pooling and query optimization
+
+**See Also**: [impl/04_STATE_MANAGER.md](impl/04_STATE_MANAGER.md) for complete implementation details
 
 ---
 
-#### 1.4 Coordinator - Simple Scheduler
+#### 1.4 Coordinator - Simple Scheduler with Affinity Support
 **Owner**: Backend Engineer
-**Duration**: 5 days
+**Duration**: 7 days
 
 **Tasks**:
-- [ ] Implement FIFO scheduler with priority queue
+- [ ] Implement FIFO scheduler with configurable batch size (100 for MVP)
 - [ ] Create scheduler loop (runs every 5 seconds)
-- [ ] Implement worker selection logic (round-robin for MVP)
+- [ ] **[CRITICAL]** Implement AffinityEvaluator for workload placement:
+  - [ ] Hard affinity evaluation (worker tags, worker ID, capabilities)
+  - [ ] Soft affinity scoring (0-100 score for preference matching)
+  - [ ] Anti-affinity checks (query running workloads on worker)
+- [ ] Implement worker selection with affinity:
+  - [ ] Filter by capacity and capability
+  - [ ] Enforce hard affinity (must match)
+  - [ ] Check anti-affinity (avoid conflicts)
+  - [ ] Score soft affinity (select best match)
 - [ ] Update workload status (PENDING → SCHEDULED)
 - [ ] Send workload assignment message to worker via NATS
 - [ ] Handle worker unavailability (retry logic)
-- [ ] Add scheduler metrics (queue depth, scheduling latency)
-- [ ] Write unit tests for scheduling logic
+- [ ] Add scheduler metrics (queue depth, scheduling latency, affinity match rate)
+- [ ] **[CRITICAL]** Add database query optimization:
+  - [ ] Prepared statement for GetPendingWorkloads
+  - [ ] Partial index on workloads(customer_id, priority DESC, created_at) WHERE status='PENDING'
+  - [ ] Query timeout (5s default)
+- [ ] Write unit tests for scheduling logic including affinity scenarios
 
-**Deliverable**: Basic scheduler that assigns workloads to available workers
+**Deliverable**: FIFO scheduler with full affinity support (hard, soft, anti-affinity) that assigns workloads to suitable workers
+
+**See Also**: [impl/06_SCHEDULER.md](impl/06_SCHEDULER.md) for complete implementation details
 
 ---
 
@@ -689,7 +741,94 @@ This document outlines a phased approach to implementing Niyanta, a distributed 
 
 ---
 
-#### 2.10 Operational Documentation
+#### 2.10 Priority Scheduler with SLA Tiers and Aging
+**Owner**: Backend Engineer
+**Duration**: 7 days
+
+**Tasks**:
+- [ ] **[CRITICAL]** Implement priority queue with heap data structure:
+  - [ ] PriorityQueueItem with effective priority calculation
+  - [ ] Push/Pop operations
+  - [ ] Priority aging mechanism
+- [ ] Implement PriorityScheduler (extends FIFOScheduler):
+  - [ ] Calculate effective priority = base_priority × tier_weight
+  - [ ] Tier weights: Free=1, Standard=10, Premium=50, Enterprise=100
+  - [ ] Fetch customer tiers for workload batches
+  - [ ] Apply aging every N minutes to prevent starvation
+  - [ ] Aging formula: effective_priority += (age_in_minutes × boost_per_minute)
+- [ ] Add configuration options:
+  - [ ] EnablePriority flag
+  - [ ] EnableAging flag
+  - [ ] AgingIntervalMinutes (default: 10)
+  - [ ] AgingBoostPerMinute (default: 5)
+- [ ] Add priority metrics (wait time by tier, starvation prevention events)
+- [ ] Write unit tests for:
+  - [ ] Priority calculation with different tiers
+  - [ ] Aging mechanism
+  - [ ] Queue ordering
+
+**Deliverable**: Priority-based scheduling with SLA enforcement and starvation prevention
+
+**See Also**: [impl/06_SCHEDULER.md](impl/06_SCHEDULER.md#priority-scheduler-with-sla-tiers-phase-2)
+
+---
+
+#### 2.11 Auto-Scaling Integration
+**Owner**: Backend Engineer + DevOps
+**Duration**: 7 days
+
+**Tasks**:
+- [ ] **[CRITICAL]** Implement custom metrics exporter:
+  - [ ] Queue depth metric publishing (every 30s)
+  - [ ] Worker utilization percentage calculation
+  - [ ] Prometheus gauge registration
+  - [ ] Error handling and recovery
+- [ ] **Kubernetes HPA Setup**:
+  - [ ] Create HPA manifest with custom metrics
+  - [ ] Configure scale triggers: queue_depth > 100 per worker
+  - [ ] Configure scale triggers: worker_utilization > 70%
+  - [ ] Set min replicas: 3, max replicas: 500
+  - [ ] Configure scale-up/down policies:
+    - [ ] Scale up: +50% every 60s (stabilization window)
+    - [ ] Scale down: -10% every 60s (stabilization window: 300s)
+- [ ] **EC2 Auto Scaling (optional)**:
+  - [ ] Publish CloudWatch custom metrics
+  - [ ] Configure ASG with target tracking
+  - [ ] Scale based on custom:QueueDepth metric
+- [ ] Test auto-scaling:
+  - [ ] Trigger scale-up with load
+  - [ ] Verify scale-down after load drops
+  - [ ] Measure scale-up time (target: < 5 minutes)
+- [ ] Add monitoring dashboards for scaling events
+
+**Deliverable**: Automatic horizontal scaling based on queue depth and utilization
+
+**See Also**: [impl/GAP_ANALYSIS.md](impl/GAP_ANALYSIS.md#missing-kubernetes-hpa-custom-metrics)
+
+---
+
+#### 2.12 Database Read Replica Support (Optional for Scale)
+**Owner**: Backend Engineer + DBA
+**Duration**: 5 days
+
+**Tasks**:
+- [ ] Add read replica URL configuration
+- [ ] Implement read/write connection splitting:
+  - [ ] Write operations → primary
+  - [ ] Read operations (queries, list) → replicas
+  - [ ] GetPendingWorkloads → replica
+  - [ ] ListWorkloads → replica
+  - [ ] GetWorkload → replica (eventually consistent OK)
+- [ ] Add connection pool for replicas
+- [ ] Add replica lag monitoring
+- [ ] Test failover scenarios
+- [ ] Document when to enable (> 5K concurrent workloads)
+
+**Deliverable**: Read replica support for query offloading at scale
+
+---
+
+#### 2.13 Operational Documentation
 **Owner**: Tech Lead + DevOps
 **Duration**: 5 days
 
@@ -699,12 +838,17 @@ This document outlines a phased approach to implementing Niyanta, a distributed 
   - [ ] Database connection issues
   - [ ] Worker scaling procedures
   - [ ] Emergency rollback
-- [ ] Create operational dashboards
+  - [ ] **[NEW]** Priority queue tuning guide
+  - [ ] **[NEW]** Auto-scaling troubleshooting
+- [ ] Create operational dashboards:
+  - [ ] **[NEW]** Queue depth over time
+  - [ ] **[NEW]** Priority distribution
+  - [ ] **[NEW]** Auto-scaling events
 - [ ] Document common troubleshooting steps
 - [ ] Write on-call guide
 - [ ] Create incident response playbook
 
-**Deliverable**: Runbooks and operational guides
+**Deliverable**: Runbooks and operational guides including scale operations
 
 ---
 
@@ -712,41 +856,32 @@ This document outlines a phased approach to implementing Niyanta, a distributed 
 
 ### Work Items
 
-#### 3.1 Workload Affinity Implementation
+#### 3.1 Advanced Affinity Tuning and Optimization
 **Owner**: Backend Engineer
-**Duration**: 7 days
+**Duration**: 4 days
 
 **Tasks**:
-- [ ] Extend scheduler to evaluate affinity rules
-- [ ] Implement hard affinity (must match)
-- [ ] Implement soft affinity (prefer match)
-- [ ] Implement anti-affinity (avoid match)
-- [ ] Add worker tag matching logic
-- [ ] Handle affinity conflicts (no suitable worker)
-- [ ] Add affinity metrics (match rate, violations)
-- [ ] Write unit tests for affinity scenarios
+- [ ] ✅ **Already implemented in Phase 1**: Basic affinity evaluation
+- [ ] Optimize soft affinity scoring algorithm:
+  - [ ] Fine-tune score weights for different tag types
+  - [ ] Add configurable scoring policies
+  - [ ] Benchmark performance with complex affinity rules
+- [ ] Implement affinity conflict resolution strategies:
+  - [ ] Fallback options when hard affinity cannot be satisfied
+  - [ ] Alerting when affinity rules cause scheduling delays
+- [ ] Add advanced affinity metrics:
+  - [ ] Affinity match rate by rule type
+  - [ ] Average scheduling time with affinity
+  - [ ] Affinity rule violation tracking
+- [ ] Write performance tests for affinity evaluation
 
-**Deliverable**: Affinity-aware scheduling
+**Deliverable**: Optimized and production-ready affinity scheduling
+
+**Note**: Core affinity features (hard, soft, anti-affinity) were implemented in Phase 1.4 and are already available.
 
 ---
 
-#### 3.2 SLA-Based Priority Scheduling
-**Owner**: Backend Engineer
-**Duration**: 5 days
-
-**Tasks**:
-- [ ] Implement priority queue with weighted scheduling
-- [ ] Map customer tier to priority weight
-- [ ] Allow explicit priority override in API
-- [ ] Implement aging to prevent starvation
-- [ ] Add priority metrics (wait time by tier)
-- [ ] Write tests for priority scheduling
-
-**Deliverable**: Priority-based scheduling with SLA tiers
-
----
-
-#### 3.3 Automatic Checkpointing
+#### 3.2 Automatic Checkpointing
 **Owner**: Backend Engineer
 **Duration**: 5 days
 
