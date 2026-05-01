@@ -1,7 +1,7 @@
 # Niyanta System Architecture
 
-**Version**: 1.0
-**Last Updated**: 2025-10-27
+**Version**: 1.1
+**Last Updated**: 2026-05-01
 **Status**: Design Phase
 
 ## Table of Contents
@@ -20,13 +20,20 @@
 
 ## Executive Summary
 
-Niyanta is a horizontally scalable distributed workload processing system designed for long-running, customer-specific jobs. The system provides:
+Niyanta is a self-orchestrated ingestion platform built on a durable distributed activity engine. Customers register connector connections and ingestion policies; the platform continuously plans, executes, observes, adapts, and recovers ingestion without requiring operators to submit individual jobs.
 
-- **Multi-tenant**: Isolated workload execution per customer with tiered SLA support
-- **Fault-tolerant**: Checkpoint-based recovery and automatic work redistribution
-- **Observable**: Comprehensive metrics, logging, and tracing per customer/workload
-- **Flexible**: Support for compile-time and runtime workload registration
-- **Deployable**: Runs on EC2/MicroVMs and Kubernetes with minimal external dependencies
+The system provides:
+
+- **Self-orchestrated ingestion**: Connector supervisors, planners, timers, and signals decide what source work should run next.
+- **Multi-tenant isolation**: Per-customer connector connections, quotas, rate limits, destinations, and SLA tiers.
+- **High deployment density**: Shared regional control planes and worker pools host many tenants and connector connections efficiently.
+- **Configurable isolation levels**: Shared, pooled, or dedicated execution depending on tenant, connector, network, and compliance requirements.
+- **Fault-tolerant execution**: Activity replay, checkpoint-based recovery, leases, fencing, and automatic redistribution.
+- **Highly observable operations**: Metrics, logs, traces, health state, source lag, checkpoint age, and destination delivery visibility per connection/run.
+- **Scalable data plane**: Partitioned ingestion by tenant, connector, account, region, source partition, time window, object prefix, cursor, and destination.
+- **Adaptable connectors**: Declarative connector definitions for common sources, with plugin escape hatches for custom protocols.
+
+See [INGESTION_ARCHITECTURE.md](INGESTION_ARCHITECTURE.md) for the ingestion-specific control loops and runtime model.
 
 ---
 
@@ -36,54 +43,62 @@ Niyanta is a horizontally scalable distributed workload processing system design
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         External Clients                             │
-│                    (Workload Submission APIs)                        │
+│                    Customers / Operators / Sources                   │
+│ definitions, connections, secrets, backfills, push events, signals    │
 └────────────────────────────┬────────────────────────────────────────┘
-                             │
                              │ HTTPS/gRPC
                              ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                      Coordinator Cluster                             │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
-│  │ Coordinator  │  │ Coordinator  │  │ Coordinator  │              │
-│  │   (Leader)   │  │  (Follower)  │  │  (Follower)  │              │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘              │
-│         │                  │                  │                      │
-│         └──────────────────┴──────────────────┘                      │
-│                            │                                         │
-└────────────────────────────┼─────────────────────────────────────────┘
-                             │
-                ┌────────────┼────────────┐
-                │            │            │
-                ▼            ▼            ▼
-        ┌───────────┐ ┌───────────┐ ┌───────────┐
-        │   Broker  │ │   State   │ │  Metrics  │
-        │   (NATS/  │ │  Storage  │ │  (Prom)   │
-        │   Redis)  │ │(Postgres/ │ │           │
-        │           │ │   etcd)   │ │           │
-        └─────┬─────┘ └─────┬─────┘ └───────────┘
-              │             │
-              │             │
-    ┌─────────┴─────────────┴─────────────┐
-    │         │             │              │
-    ▼         ▼             ▼              ▼
-┌────────┐┌────────┐┌────────┐┌────────┐
-│Worker 1││Worker 2││Worker 3││Worker N│
-│        ││        ││        ││        │
-│Workload││Workload││Workload││Workload│
-│  A, B  ││  C, D  ││  A, C  ││  B, E  │
-└────────┘└────────┘└────────┘└────────┘
+│                 Coordinator + Ingestion Control Plane                │
+│ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ │
+│ │ API Server   │ │ Connector    │ │ Ingestion    │ │ Health &     │ │
+│ │              │ │ Registry     │ │ Planner      │ │ Policy Ctrl  │ │
+│ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ │
+│        │                │                │                │         │
+│ ┌──────▼────────────────▼────────────────▼────────────────▼───────┐ │
+│ │ Durable activity scheduler, timers, signals, leases, fencing      │ │
+│ └────────────────────────────┬─────────────────────────────────────┘ │
+└──────────────────────────────┼───────────────────────────────────────┘
+                               │
+               ┌───────────────┼───────────────┐
+               │               │               │
+               ▼               ▼               ▼
+       ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+       │ Broker       │ │ State Store  │ │ Observability│
+       │ NATS/        │ │ Postgres     │ │ Metrics/Logs │
+       │ JetStream    │ │ + optional   │ │ Traces       │
+       │              │ │ etcd         │ │              │
+       └──────┬───────┘ └──────┬───────┘ └──────────────┘
+              │                │
+              ▼                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                       Connector Runtime Workers                      │
+│ ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌───────────────────┐ │
+│ │ HTTP Poll  │ │ Push       │ │ Object     │ │ Stream / Plugin   │ │
+│ │ Runtime    │ │ Gateway    │ │ Reader     │ │ Runtime           │ │
+│ └─────┬──────┘ └─────┬──────┘ └─────┬──────┘ └─────────┬─────────┘ │
+│       │              │              │                  │           │
+│ ┌─────▼──────────────▼──────────────▼──────────────────▼─────────┐ │
+│ │ auth, request, paging, parsing, transform, dedupe, sink, commit  │ │
+│ └─────────────────────────────────────────────────────────────────┘ │
+└──────────────┬──────────────────────────────────────┬───────────────┘
+               │                                      │
+               ▼                                      ▼
+        External Sources                      Downstream Destinations
 ```
 
 ### Core Components
 
 | Component | Count | Purpose | Stateful |
 |-----------|-------|---------|----------|
-| Coordinator | 3+ (HA) | Scheduling, lifecycle management, API gateway | No |
-| Worker | N (horizontal) | Workload execution | No |
-| State Storage | 1 cluster | Persistent state, checkpoints, config | Yes |
-| Broker | 1 cluster | Control plane communication | No (ephemeral) |
-| Metrics Store | 1 | Observability and monitoring | Yes (time-series) |
+| Coordinator | 3+ (HA) | API, ingestion planning, activity scheduling, lifecycle management | No |
+| Connector Registry | 1 logical service | Versioned connector definitions, schemas, policies, capabilities | Yes |
+| Connection Manager | 1 logical service | Customer connector instances, config validation, secret refs, destinations | Yes |
+| Ingestion Planner | Leader-only loop, shardable later | Creates runs from schedules, lag, backfills, source state, and policies | No |
+| Worker | N (horizontal) | Dense multi-tenant connector runtime execution and delivery | No |
+| State Storage | 1 cluster | Persistent state, checkpoints, connector config, audit | Yes |
+| Broker | 1 cluster | Control plane communication and optional durable signal substrate | Optional |
+| Observability Store | 1+ | Metrics, logs, traces, health timelines | Yes |
 
 ---
 
@@ -92,11 +107,13 @@ Niyanta is a horizontally scalable distributed workload processing system design
 ### 1. Coordinator
 
 **Responsibilities**:
-- Accept workload submissions via REST/gRPC API
-- Schedule workloads to appropriate workers based on affinity, capacity, and SLA
+- Accept connector definitions, connection configuration, backfill requests, signals, and operational API calls
+- Reconcile connector connections and validate configuration, secret references, and destinations
+- Plan ingestion runs from schedules, source lag, checkpoint state, backfills, and health policy
+- Schedule activity attempts to appropriate workers based on connector capabilities, affinity, capacity, tenant quota, and SLA
 - Monitor worker health via broker heartbeats
 - Detect failures and trigger redistribution
-- Manage workload lifecycle (start, pause, resume, cancel, complete)
+- Manage connector, run, and activity lifecycle (start, pause, resume, cancel, complete, quarantine)
 - Expose metrics and health endpoints
 
 **Internal Modules**:
@@ -112,30 +129,29 @@ Niyanta is a horizontally scalable distributed workload processing system design
 │          │                     │                    │
 │          ▼                     ▼                    │
 │  ┌──────────────────────────────────────┐          │
-│  │      Workload Manager                │          │
-│  │  - Validation                        │          │
-│  │  - Lifecycle State Machine           │          │
+│  │      Connection Manager              │          │
+│  │  - Connector config validation       │          │
+│  │  - Secret and destination refs       │          │
 │  └──────────────┬───────────────────────┘          │
 │                 │                                   │
 │                 ▼                                   │
 │  ┌──────────────────────────────────────┐          │
+│  │      Ingestion Planner               │          │
+│  │  - Schedules, lag, backfills         │          │
+│  │  - Adaptive source policies          │          │
+│  └──────────────┬───────────────────────┘          │
+│                 │                                   │
+│  ┌──────────────┴───────────────────────┐          │
 │  │      Scheduler                       │          │
-│  │  - Affinity Rules Engine             │          │
-│  │  - Capacity Planning                 │          │
-│  │  - SLA Priority Queue                │          │
+│  │  - Capability and affinity rules     │          │
+│  │  - Capacity and quota planning       │          │
+│  │  - SLA priority queue                │          │
 │  └──────────────┬───────────────────────┘          │
 │                 │                                   │
 │  ┌──────────────┴───────────────────────┐          │
-│  │   Worker Health Monitor              │          │
-│  │  - Heartbeat tracking                │          │
-│  │  - Failure detection                 │          │
-│  │  - Redistribution trigger            │          │
-│  └──────────────┬───────────────────────┘          │
-│                 │                                   │
-│  ┌──────────────┴───────────────────────┐          │
-│  │   State Manager (Client)             │          │
-│  │  - Checkpoint coordination           │          │
-│  │  - Audit logging                     │          │
+│  │   Health & State Manager             │          │
+│  │  - Worker/source/destination health  │          │
+│  │  - Checkpoints and audit logging     │          │
 │  └──────────────────────────────────────┘          │
 │                                                     │
 └─────────────────────────────────────────────────────┘
@@ -143,13 +159,16 @@ Niyanta is a horizontally scalable distributed workload processing system design
 
 **Concurrency Model**:
 - Request handler per API call (goroutine pool)
-- Single scheduler loop (leader only in HA setup)
+- Connection reconciliation loop (leader only initially; shardable by customer/connection)
+- Ingestion planning loop (leader only initially; shardable at high scale)
+- Single scheduler loop for activity attempts (leader only in HA setup)
 - Per-worker health monitor (one goroutine per worker)
+- Source and destination health policy evaluators
 - Event processor for broker messages (worker pool)
 
 **Leader Election** (HA Mode):
 - Use etcd or Postgres advisory locks for leader election
-- Only leader runs scheduler and health monitors
+- Only leader runs planner, scheduler, timers, signal listener, and health controllers
 - Followers handle API requests and forward to state storage
 - Leader heartbeat timeout: 10 seconds
 - Failover time: < 30 seconds
@@ -159,10 +178,12 @@ Niyanta is a horizontally scalable distributed workload processing system design
 ### 2. Worker
 
 **Responsibilities**:
-- Register with coordinator on boot (advertise capabilities)
-- Listen for workload assignments on broker
-- Execute workloads with resource isolation
-- Report progress and checkpoints periodically
+- Register with coordinator on boot and advertise connector runtime capabilities
+- Listen for ingestion activity assignments on broker
+- Execute connector runtime stages with resource isolation
+- Resolve secrets through approved providers, never through activity input payloads
+- Read from sources, parse, transform, dedupe, deliver, and commit checkpoints
+- Report progress, source lag, delivery state, and checkpoints periodically
 - Handle graceful shutdown (drain in-flight work)
 - Send heartbeats to coordinator
 
@@ -180,8 +201,8 @@ Niyanta is a horizontally scalable distributed workload processing system design
 │          │                     │                    │
 │          ▼                     ▼                    │
 │  ┌──────────────────────────────────────┐          │
-│  │   Workload Execution Engine          │          │
-│  │  - Plugin loader                     │          │
+│  │   Connector Runtime Engine           │          │
+│  │  - Declarative/runtime plugin loader │          │
 │  │  - Resource isolation (cgroups)      │          │
 │  │  - Context cancellation              │          │
 │  └──────────────┬───────────────────────┘          │
@@ -196,20 +217,20 @@ Niyanta is a horizontally scalable distributed workload processing system design
 │                 │                                   │
 │  ┌──────────────┴───────────────────────┐          │
 │  │   Heartbeat & Health Reporter        │          │
-│  │  - Capacity calculation              │          │
-│  │  - Workload inventory snapshot       │          │
+│  │  - Capacity and source lag snapshot  │          │
+│  │  - In-flight run inventory           │          │
 │  └──────────────────────────────────────┘          │
 │                                                     │
 └─────────────────────────────────────────────────────┘
 ```
 
-**Workload Plugin Interface**:
+**Activity Plugin Interface**:
 ```go
-type Workload interface {
-    // Initialize workload with config and optional checkpoint
-    Init(ctx context.Context, config WorkloadConfig, checkpoint []byte) error
+type Activity interface {
+    // Initialize activity with config and optional checkpoint
+    Init(ctx context.Context, config ActivityConfig, checkpoint []byte) error
 
-    // Execute workload (long-running)
+    // Execute activity (long-running)
     Execute(ctx context.Context, progressReporter ProgressReporter) error
 
     // Create checkpoint of current state
@@ -220,7 +241,7 @@ type Workload interface {
 }
 ```
 
-**Resource Limits** (per workload):
+**Resource Limits** (per activity/run):
 - CPU: Configurable (default: 1 core)
 - Memory: Configurable (default: 512MB)
 - Disk I/O: Rate limited
@@ -234,7 +255,7 @@ type Workload interface {
 
 | Use Case | PostgreSQL | etcd |
 |----------|-----------|------|
-| Workload metadata | ✓ (Primary) | ✗ |
+| Connector/activity metadata | ✓ (Primary) | ✗ |
 | Checkpoints (< 1MB) | ✓ | ✓ |
 | Configuration | ✓ | ✓ |
 | Audit logs | ✓ | ✗ |
@@ -242,15 +263,15 @@ type Workload interface {
 | Watch/notifications | ✗ (LISTEN/NOTIFY) | ✓ (native) |
 
 **Recommended Approach**: **Hybrid**
-- **PostgreSQL**: Primary data store (workloads, checkpoints, audit, config)
+- **PostgreSQL**: Primary data store (connector config, activity state, checkpoints, audit)
 - **etcd**: Leader election and configuration watches (optional, if not using Postgres)
 
 **Schema Design**: See [DATA_MODELS.md](DATA_MODELS.md)
 
 **Consistency Model**:
-- Strong consistency for workload state transitions (use transactions)
+- Strong consistency for connector run and activity state transitions (use transactions)
 - Eventual consistency acceptable for metrics aggregation
-- Checkpoint writes are atomic per workload
+- Checkpoint writes are atomic per activity/run
 
 **Backup Strategy**:
 - PostgreSQL: Continuous WAL archiving + daily base backups
@@ -277,7 +298,7 @@ type Workload interface {
 | Channel Pattern | Direction | Purpose |
 |----------------|-----------|---------|
 | `coordinator.broadcast` | Coordinator → All Workers | System-wide announcements |
-| `worker.{worker_id}.commands` | Coordinator → Specific Worker | Workload assignments, cancel |
+| `worker.{worker_id}.commands` | Coordinator → Specific Worker | Activity assignments, cancel |
 | `worker.{worker_id}.status` | Worker → Coordinator | Heartbeats, progress |
 | `coordinator.events` | Worker → Coordinator | Registration, completion |
 
@@ -290,12 +311,49 @@ type Workload interface {
 
 ## Data Flow
 
-### Workload Submission Flow
+### Self-Orchestrated Ingestion Flow
+
+```
+Operator/API        Coordinator          State Store       Planner/Scheduler       Worker          Destination
+    │                   │                    │                    │                  │                  │
+    │ Create connection │                    │                    │                  │                  │
+    ├──────────────────>│                    │                    │                  │                  │
+    │                   │ Validate config    │                    │                  │                  │
+    │                   │ and secret refs    │                    │                  │                  │
+    │                   ├───────────────────>│                    │                  │                  │
+    │                   │ Reconcile enabled connection            │                  │                  │
+    │                   ├────────────────────────────────────────>│                  │                  │
+    │                   │                    │                    │ Plan windows,    │                  │
+    │                   │                    │                    │ partitions, lag  │                  │
+    │                   │                    │<───────────────────┤                  │                  │
+    │                   │                    │ Create ConnectorRun│                  │                  │
+    │                   │                    │ and activity       │                  │                  │
+    │                   │                    │<───────────────────┤                  │                  │
+    │                   │                    │                    │ Assign attempt   │                  │
+    │                   │                    │                    ├─────────────────>│                  │
+    │                   │                    │                    │                  │ Read source,     │
+    │                   │                    │                    │                  │ parse, transform │
+    │                   │                    │                    │                  │ dedupe, batch    │
+    │                   │                    │                    │                  ├─────────────────>│
+    │                   │                    │                    │                  │ Delivery ack     │
+    │                   │                    │                    │                  │<─────────────────┤
+    │                   │                    │ Commit checkpoint  │                  │                  │
+    │                   │                    │<───────────────────────────────────────┤                  │
+    │                   │                    │                    │ Health feedback  │                  │
+    │                   │<───────────────────────────────────────────────────────────┤                  │
+    │                   │ Adapt next poll/backfill/concurrency    │                  │                  │
+```
+
+This is the primary product flow. A customer creates a connector connection once; Niyanta owns ongoing run creation, partitioning, checkpointing, retries, backoff, and health transitions.
+
+### Activity Submission Flow
+
+This lower-level flow still exists for generic activity execution and internal ingestion activities. It is no longer the primary ingestion user experience.
 
 ```
 Client                Coordinator          State Store         Broker              Worker
   │                       │                     │                 │                   │
-  │  POST /workload       │                     │                 │                   │
+  │  POST /activity       │                     │                 │                   │
   ├──────────────────────>│                     │                 │                   │
   │                       │                     │                 │                   │
   │                       │ Validate & Create   │                 │                   │
@@ -305,7 +363,7 @@ Client                Coordinator          State Store         Broker           
   │                       │<────────────────────┤                 │                   │
   │  202 Accepted         │                     │                 │                   │
   │<──────────────────────┤                     │                 │                   │
-  │  (workload_id)        │                     │                 │                   │
+  │  (activity_id)        │                     │                 │                   │
   │                       │                     │                 │                   │
   │                       │ Scheduler selects   │                 │                   │
   │                       │ target worker       │                 │                   │
@@ -317,7 +375,7 @@ Client                Coordinator          State Store         Broker           
   │                       │ Send assignment     │                 │                   │
   │                       ├─────────────────────┼────────────────>│                   │
   │                       │                     │                 │                   │
-  │                       │                     │                 │  Start workload   │
+  │                       │                     │                 │  Start activity   │
   │                       │                     │                 ├──────────────────>│
   │                       │                     │                 │                   │
   │                       │                     │                 │  Ack              │
@@ -333,7 +391,7 @@ Client                Coordinator          State Store         Broker           
 ```
 Worker              Broker            Coordinator       State Store
   │                   │                    │                 │
-  │ (workload runs)   │                    │                 │
+  │ (activity runs)   │                    │                 │
   │                   │                    │                 │
   │ Create checkpoint │                    │                 │
   │                   │                    │                 │
@@ -363,7 +421,7 @@ Worker A            Broker         Coordinator        State Store       Worker B
   │                   │                 ├─────────────────>│                │
   │                   │                 │                  │                │
   │                   │                 │ Get assigned     │                │
-  │                   │                 │ workloads        │                │
+  │                   │                 │ activities       │                │
   │                   │                 │<─────────────────┤                │
   │                   │                 │                  │                │
   │                   │                 │ Update status:   │                │
@@ -373,7 +431,7 @@ Worker A            Broker         Coordinator        State Store       Worker B
   │                   │                 │ Find new worker  │                │
   │                   │                 │ (Worker B)       │                │
   │                   │                 │                  │                │
-  │                   │                 │ Assign workload  │                │
+  │                   │                 │ Assign activity  │                │
   │                   │                 ├─────────────────────────────────>│
   │                   │                 │                  │                │
   │                   │                 │                  │   Load last    │
@@ -426,7 +484,7 @@ Worker A            Broker         Coordinator        State Store       Worker B
 
 ### State Invariants
 
-1. **Workload Assignment**: A workload in RUNNING state MUST have exactly one assigned worker
+1. **Activity Assignment**: An activity attempt in RUNNING state MUST have exactly one assigned worker
 2. **Checkpoint Consistency**: Latest checkpoint MUST correspond to a valid execution point
 3. **Lease Timeout**: Worker lease expires after 2x heartbeat interval (60s default)
 4. **Idempotency**: State transitions MUST be idempotent (safe to replay)
@@ -437,8 +495,8 @@ Worker A            Broker         Coordinator        State Store       Worker B
 
 ### 1. Request-Reply (Synchronous)
 **Use Case**: Coordinator → Worker commands that need acknowledgment
-- Assign workload
-- Cancel workload
+- Assign activity
+- Cancel activity
 - Request capacity report
 
 **Timeout**: 10 seconds
@@ -454,8 +512,8 @@ Worker A            Broker         Coordinator        State Store       Worker B
 
 ### 3. State-Based (Via State Storage)
 **Use Case**: Cross-component coordination
-- Scheduler queries pending workloads from state storage
-- Worker reads workload config from state storage
+- Scheduler queries pending activity attempts from state storage
+- Worker reads activity/connector config from state storage
 - Audit trail writes
 
 ---
@@ -551,7 +609,7 @@ spec:
 - Auto-recovery: CloudWatch alarms + Auto Scaling Group
 
 **Worker**:
-- Instance Type: c5.xlarge or larger (depends on workload)
+- Instance Type: c5.xlarge or larger (depends on connector runtime)
 - Count: Auto-scaling group (min: 3, max: 100)
 - Scaling Metric: Custom CloudWatch metric from coordinator (queue depth)
 
@@ -588,22 +646,22 @@ spec:
 
 ### Worker Fault Tolerance
 
-**Workload Isolation**:
-- Each workload runs in separate goroutine with context
+**Activity Isolation**:
+- Each activity attempt runs in a separate goroutine with context
 - Resource limits enforced via cgroups (Linux) or job objects (Windows)
 - Panic recovery to prevent worker crash
 
 **Graceful Shutdown**:
 1. Worker receives SIGTERM
-2. Stop accepting new workloads
-3. Send in-flight workload list to coordinator
-4. Checkpoint and pause all workloads
+2. Stop accepting new activity attempts
+3. Send in-flight activity/run list to coordinator
+4. Checkpoint and pause all activities
 5. Exit after drain timeout (default: 5 minutes)
 
 **Ungraceful Failure**:
 - Heartbeat timeout triggers coordinator detection (60s)
 - Coordinator marks worker DEAD
-- Workloads enter REDISTRIBUTING state
+- Activity attempts enter REDISTRIBUTING state
 - Scheduler finds new workers for reassignment
 
 ### State Storage HA
@@ -637,7 +695,7 @@ spec:
 
 **Worker Authentication**:
 - Workers authenticate to coordinator using pre-shared secrets or mTLS
-- Worker identity includes `worker_id` and supported `workload_types`
+- Worker identity includes `worker_id` and supported activity and connector runtime types
 
 ### Network Security
 
@@ -659,7 +717,7 @@ spec:
 **Configuration**:
 - Database credentials: Kubernetes Secrets / AWS Secrets Manager
 - Broker credentials: Same as above
-- Workload-specific secrets: Passed as encrypted blobs, decrypted in worker
+- Connector secrets: Stored as secret references and resolved inside approved worker runtimes
 
 **Encryption**:
 - Data in transit: TLS 1.3 for all component communication
@@ -674,32 +732,60 @@ spec:
 | Component | Scale Trigger | Scale Limit | Notes |
 |-----------|---------------|-------------|-------|
 | Coordinator | CPU > 70% | 10 instances | Stateless, unlimited in theory |
-| Worker | Queue depth > 100 | 500 instances | Depends on workload resource needs |
+| Worker | Queue depth > 100 | 500 instances | Depends on connector runtime resource needs |
 | State Storage | Connections, IOPS | 1 primary + replicas | Vertical scaling needed |
 | Broker | Message throughput | 3-node cluster sufficient | Very lightweight |
+
+### Deployment Density And Isolation
+
+Niyanta is designed for dense shared deployments by default. A regional deployment should host many tenants, connector definitions, and connector connections while enforcing tenant isolation at the storage, scheduling, secret, network, and observability layers.
+
+Isolation modes:
+
+| Mode | Compute | State | Secrets | Network | Default use |
+|------|---------|-------|---------|---------|-------------|
+| Shared | Shared worker pool | Shared DB with tenant keys/RLS | Tenant-scoped refs | Shared egress | Standard high-density tenants |
+| Pooled | Worker pool per tier/region | Shared DB with tenant keys/RLS | Tenant-scoped refs | Segmented egress | High-volume tenants |
+| Dedicated | Tenant-specific workers | Tenant schema/DB optional | Tenant vault namespace | Dedicated egress/VPC | Regulated or high-risk tenants |
+
+Isolation requirements:
+
+- All state rows include tenant scope.
+- Storage APIs enforce tenant filters centrally.
+- Secrets are referenced, not copied into activity inputs.
+- Scheduler enforces per-tenant concurrency and queue caps.
+- Metrics/logs/traces include tenant and connection dimensions without exposing payloads.
+- Backfills and failing connections cannot consume the whole shared worker pool.
 
 ### Capacity Planning
 
 **Per-Customer Limits** (configurable):
-- Max concurrent workloads: 100 (default), up to 1000 (premium)
+- Max enabled connector connections: tier-based
+- Max concurrent ingestion runs: 100 (default), up to 1000 (premium)
 - Max queue depth: 500
-- Rate limits: 10 submissions/second
+- API rate limits: 10 submissions/second
+- Source and destination rate limits: connector-policy based
+- Isolation mode: shared by default, pooled/dedicated by policy
 
 **System-Wide Limits** (initial):
 - Total customers: 1000
-- Total concurrent workloads: 10,000
+- Total enabled connector connections: 10,000
+- Total planned runs per hour: 100,000
+- Total concurrent activity attempts: 10,000
 - Worker pool size: 100-500 workers
 
 ### Performance Targets
 
 | Metric | Target | Notes |
 |--------|--------|-------|
-| Workload submission latency | p95 < 100ms | API response time |
-| Scheduling latency | p95 < 5s | Time from PENDING to SCHEDULED |
-| Worker assignment latency | p95 < 10s | Time from SCHEDULED to RUNNING |
+| Connection API latency | p95 < 100ms | API response time |
+| Planner decision latency | p95 < 10s | Time from due connection to planned run |
+| Scheduling latency | p95 < 5s | Time from PENDING attempt to assigned worker |
+| Worker assignment latency | p95 < 10s | Time from planned run to RUNNING |
 | Failure detection time | < 60s | Heartbeat timeout |
 | Redistribution time | < 2 minutes | From failure to reassignment |
-| Checkpoint frequency | 5-10 minutes | Configurable per workload |
+| Checkpoint commit latency | p95 < 1s | After destination delivery ack |
+| Source lag | Connector SLO | Policy-defined by connector and tenant tier |
 
 ---
 
@@ -708,15 +794,24 @@ spec:
 ### Key Metrics
 
 **Coordinator**:
-- `niyanta_workload_submissions_total` (counter, by customer, status)
-- `niyanta_workload_duration_seconds` (histogram, by customer, workload_type)
+- `niyanta_ingestion_connections_total` (gauge, by customer, connector, status)
+- `niyanta_ingestion_planner_cycle_duration_seconds` (histogram)
+- `niyanta_ingestion_runs_total` (counter, by customer, connector, result)
+- `niyanta_ingestion_run_duration_seconds` (histogram, by customer, connector)
 - `niyanta_scheduler_queue_depth` (gauge, by priority)
 - `niyanta_worker_pool_size` (gauge, by status: healthy/dead)
 
 **Worker**:
 - `niyanta_worker_capacity_total` (gauge)
 - `niyanta_worker_capacity_used` (gauge)
-- `niyanta_workload_executions_total` (counter, by workload_type, result)
+- `niyanta_activity_attempts_total` (counter, by activity_type, result)
+- `niyanta_ingestion_records_read_total` (counter, by connector)
+- `niyanta_ingestion_records_emitted_total` (counter, by connector, destination)
+- `niyanta_ingestion_records_dropped_total` (counter, by connector, reason)
+- `niyanta_ingestion_source_lag_seconds` (gauge, by connection)
+- `niyanta_ingestion_checkpoint_age_seconds` (gauge, by connection)
+- `niyanta_ingestion_delivery_failures_total` (counter, by destination)
+- `niyanta_ingestion_rate_limit_backoffs_total` (counter, by source)
 - `niyanta_checkpoint_duration_seconds` (histogram)
 
 **State Storage**:
@@ -732,15 +827,18 @@ spec:
   "component": "coordinator",
   "correlation_id": "abc123",
   "customer_id": "customer_456",
-  "workload_id": "wl_789",
-  "message": "Workload scheduled to worker-5",
+  "connection_id": "conn_789",
+  "connector_definition_id": "github_audit",
+  "run_id": "run_123",
+  "activity_id": "act_456",
+  "message": "Ingestion run scheduled to worker-5",
   "worker_id": "worker-5"
 }
 ```
 
 **Log Levels**:
 - **DEBUG**: Detailed internal state (disabled in production)
-- **INFO**: Normal operations (workload state changes)
+- **INFO**: Normal operations (connection/run/activity state changes)
 - **WARN**: Recoverable errors (retry attempts)
 - **ERROR**: Failures requiring attention
 
@@ -750,12 +848,15 @@ spec:
 - Coordinator leader election fails
 - Database connection pool exhausted
 - Worker failure rate > 10% in 5 minutes
-- Workload redistribution failures
+- Ingestion redistribution failures
+- Critical connector lag exceeds SLO
+- Destination delivery failures exceed policy
 
 **Warning Alerts** (ticket):
 - Queue depth > threshold for > 10 minutes
 - Checkpoint failure rate > 5%
 - API latency p95 > 500ms
+- Connection enters degraded/failing/quarantined state
 
 ---
 
@@ -763,7 +864,7 @@ spec:
 
 ### ADR-001: State Storage Choice
 **Decision**: PostgreSQL as primary, etcd optional for leader election
-**Rationale**: PostgreSQL handles complex queries (audit logs, workload history), provides ACID guarantees, mature backup/restore. etcd better for watches but limited query capability.
+**Rationale**: PostgreSQL handles complex queries (audit logs, connector/run/activity history), provides ACID guarantees, mature backup/restore. etcd better for watches but limited query capability.
 **Alternatives Considered**: MongoDB (schemaless but weak consistency), Cassandra (eventual consistency issues)
 
 ### ADR-002: Broker Choice
@@ -785,10 +886,10 @@ spec:
 
 ## Open Questions
 
-1. **Workload Priority**: Should we support priority levels within a single customer? (e.g., critical vs. batch)
+1. **Ingestion Priority**: Should we support priority levels within a single customer? (e.g., critical vs. batch)
 2. **Checkpoint Compression**: Should checkpoints be compressed automatically?
 3. **Multi-Region**: How to handle cross-region deployments? (Future phase)
-4. **Workload Versioning**: How to handle workload code updates without disrupting running instances?
+4. **Connector/Activity Versioning**: How to handle connector or activity code updates without disrupting running instances?
 
 ---
 

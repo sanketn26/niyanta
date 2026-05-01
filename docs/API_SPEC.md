@@ -1,7 +1,7 @@
 # Niyanta API Specification
 
-**Version**: 1.0
-**Last Updated**: 2025-10-27
+**Version**: 1.1
+**Last Updated**: 2026-05-01
 **Status**: Design Phase
 
 ## Table of Contents
@@ -21,7 +21,7 @@
 
 Niyanta exposes two API surfaces:
 
-1. **Coordinator REST/gRPC API**: For clients to submit, query, and manage workloads
+1. **Coordinator REST/gRPC API**: For clients to manage ingestion, connector connections, and activities
 2. **Internal Broker Protocol**: For coordinator-worker communication (see [DATA_MODELS.md](DATA_MODELS.md))
 
 This document focuses on the **Coordinator API** for external clients.
@@ -70,6 +70,256 @@ Authorization: Bearer <jwt_token>
 ## REST API Endpoints
 
 **Base URL**: `https://api.niyanta.example.com/v1`
+
+### 0. Customer Ingestion Operations
+
+These endpoints are the primary operator surface for a customer (`cid`). All responses are tenant-scoped. Callers must either authenticate as that customer or hold an internal support/admin permission for the requested `cid`.
+
+#### 0.1 Get Customer Ingestion View
+
+**Endpoint**: `GET /customers/{cid}/ingestion-view`
+
+**Description**: Return a customer-scoped ingestion dashboard view: connection health, active controls, significant events, lag, checkpoint age, and recent run metrics.
+
+**Query Parameters**:
+- `window` (optional): Metrics window, for example `15m`, `1h`, `24h` (default: `1h`)
+- `include_events` (optional): Include significant events (default: `true`)
+- `status` (optional): Filter connections by effective status
+
+**Response**: `200 OK`
+```json
+{
+  "customer_id": "cust_abc",
+  "summary": {
+    "connections_total": 42,
+    "connected": 35,
+    "degraded": 4,
+    "failing": 2,
+    "temporarily_disabled": 1,
+    "quarantined": 0
+  },
+  "connections": [
+    {
+      "connection_id": "conn_123",
+      "name": "prod-github-audit",
+      "connector_id": "github_audit",
+      "health": "degraded",
+      "effective_status": "rate_limited",
+      "source_lag_seconds": 900,
+      "checkpoint_age_seconds": 300,
+      "records_read": 12000,
+      "records_emitted": 11980,
+      "records_dropped": 20,
+      "active_controls": [
+        {
+          "control_id": "ctrl_123",
+          "control_type": "rate_limit_override",
+          "expires_at": "2026-05-01T18:00:00Z",
+          "reason": "source 429 spike"
+        }
+      ],
+      "latest_significant_event": {
+        "event_id": "evt_123",
+        "event_type": "source_rate_limited",
+        "severity": "warning",
+        "message": "Source returned repeated 429 responses",
+        "created_at": "2026-05-01T17:05:00Z"
+      }
+    }
+  ],
+  "significant_events": []
+}
+```
+
+#### 0.2 List Significant Ingestion Events
+
+**Endpoint**: `GET /customers/{cid}/ingestion-events`
+
+**Query Parameters**:
+- `significant` (optional): `true` or `false` (default: `true`)
+- `connection_id` (optional): Filter by connection
+- `event_type` (optional): Filter by event type
+- `severity` (optional): Filter by severity
+- `from` / `to` (optional): RFC3339 timestamps
+- `limit` (optional): Default `100`, max `500`
+
+#### 0.3 Create Significant Event Filter
+
+**Endpoint**: `POST /customers/{cid}/ingestion-event-filters`
+
+**Request Body**:
+```json
+{
+  "name": "Repeated source throttling",
+  "enabled": true,
+  "scope": {
+    "connector_id": "github_audit",
+    "connection_id": null
+  },
+  "match": {
+    "event_types": ["source_rate_limited"],
+    "severities": ["warning", "error"],
+    "min_count": 3,
+    "window_seconds": 300
+  },
+  "action": {
+    "mark_significant": true,
+    "alert": true
+  }
+}
+```
+
+**Response**: `201 Created`
+```json
+{
+  "filter_id": "flt_123",
+  "status": "enabled"
+}
+```
+
+#### 0.4 List Significant Event Filters
+
+**Endpoint**: `GET /customers/{cid}/ingestion-event-filters`
+
+**Response**: `200 OK`
+```json
+{
+  "filters": [
+    {
+      "filter_id": "flt_123",
+      "name": "Repeated source throttling",
+      "enabled": true,
+      "scope": {
+        "connector_id": "github_audit"
+      },
+      "match": {
+        "event_types": ["source_rate_limited"],
+        "severities": ["warning", "error"],
+        "min_count": 3,
+        "window_seconds": 300
+      },
+      "action": {
+        "mark_significant": true,
+        "alert": true
+      }
+    }
+  ]
+}
+```
+
+#### 0.5 Update Significant Event Filter
+
+**Endpoint**: `PATCH /customers/{cid}/ingestion-event-filters/{filter_id}`
+
+**Request Body**:
+```json
+{
+  "enabled": false
+}
+```
+
+**Response**: `200 OK`
+```json
+{
+  "filter_id": "flt_123",
+  "status": "disabled"
+}
+```
+
+#### 0.6 Apply Rate Limit To Erring Connection
+
+**Endpoint**: `POST /connector-connections/{connection_id}:rate-limit`
+
+**Description**: Apply a tenant-scoped temporary rate-limit override to an erring connection. The planner reads this before creating future runs.
+
+**Request Body**:
+```json
+{
+  "qps": 0.25,
+  "burst": 1,
+  "max_parallel_partitions": 1,
+  "duration_seconds": 3600,
+  "reason": "Repeated source 429 responses"
+}
+```
+
+**Response**: `202 Accepted`
+```json
+{
+  "control_id": "ctrl_123",
+  "connection_id": "conn_123",
+  "control_type": "rate_limit_override",
+  "expires_at": "2026-05-01T18:00:00Z"
+}
+```
+
+#### 0.7 Temporarily Disable Erring Connection
+
+**Endpoint**: `POST /connector-connections/{connection_id}:temporary-disable`
+
+**Description**: Stop planning new runs for a connection until `expires_at`. In-flight runs may complete unless separately cancelled.
+
+**Request Body**:
+```json
+{
+  "duration_seconds": 1800,
+  "reason": "Destination outage causing repeated delivery failures"
+}
+```
+
+**Response**: `202 Accepted`
+```json
+{
+  "control_id": "ctrl_456",
+  "connection_id": "conn_123",
+  "control_type": "temporary_disable",
+  "expires_at": "2026-05-01T17:30:00Z"
+}
+```
+
+#### 0.8 List Active Connection Controls
+
+**Endpoint**: `GET /connector-connections/{connection_id}/controls`
+
+**Response**: `200 OK`
+```json
+{
+  "connection_id": "conn_123",
+  "controls": [
+    {
+      "control_id": "ctrl_123",
+      "control_type": "rate_limit_override",
+      "config": {
+        "qps": 0.25,
+        "burst": 1,
+        "max_parallel_partitions": 1
+      },
+      "reason": "Repeated source 429 responses",
+      "expires_at": "2026-05-01T18:00:00Z"
+    }
+  ]
+}
+```
+
+#### 0.9 Clear Connection Control
+
+**Endpoint**: `POST /connector-connections/{connection_id}:clear-control`
+
+**Request Body**:
+```json
+{
+  "control_type": "rate_limit_override",
+  "reason": "Source recovered"
+}
+```
+
+**Response**: `200 OK`
+```json
+{
+  "connection_id": "conn_123",
+  "cleared": true
+}
+```
 
 ### 1. Workload Management
 

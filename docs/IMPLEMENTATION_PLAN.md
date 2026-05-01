@@ -1,1130 +1,300 @@
 # Niyanta Implementation Plan
 
-**Version**: 1.0
-**Last Updated**: 2025-10-27
+**Version**: 2.1
+**Last Updated**: 2026-05-01
 **Status**: Planning Phase
+**Supersedes**: v1.0 (workload-based model). Reframed around the activity execution model defined in [ADR-005](adr/ADR-005-activity-execution-model.md).
 
 ## Table of Contents
 1. [Executive Summary](#executive-summary)
 2. [Development Phases](#development-phases)
-3. [Phase 0: Foundation & Setup](#phase-0-foundation--setup)
-4. [Phase 1: MVP - Core Functionality](#phase-1-mvp---core-functionality)
-5. [Phase 2: Production Hardening](#phase-2-production-hardening)
-6. [Phase 3: Advanced Features](#phase-3-advanced-features)
-7. [Phase 4: Scale & Optimization](#phase-4-scale--optimization)
-8. [Work Item Breakdown](#work-item-breakdown)
-9. [Resource Requirements](#resource-requirements)
-10. [Risk Management](#risk-management)
-11. [Success Metrics](#success-metrics)
-12. [Timeline & Milestones](#timeline--milestones)
+   - [Phase 0: End-to-end skeleton, in-memory only](#phase-0-end-to-end-skeleton-in-memory-only)
+   - [Phase 1: Persistence and framework-managed retries](#phase-1-persistence-and-framework-managed-retries)
+   - [Phase 2: Multi-process — coordinator + workers, NATS for control plane](#phase-2-multi-process--coordinator--workers-nats-for-control-plane)
+   - [Phase 3: Sub-activities and replay-based resume](#phase-3-sub-activities-and-replay-based-resume)
+   - [Phase 4: Deterministic primitives and signals](#phase-4-deterministic-primitives-and-signals)
+   - [Phase 5: Production ingestion shape — connectors, planner, API, observability](#phase-5-production-ingestion-shape--connectors-planner-api-observability)
+   - [Phase 6: HA, scale, hardening](#phase-6-ha-scale-hardening)
+3. [Resource Requirements](#resource-requirements) (multi-engineer view; preserved from v1)
+4. [Risk Management](#risk-management)
+5. [Success Metrics](#success-metrics)
+6. [Timeline & Milestones](#timeline--milestones)
+7. [Post-Phase 6 Roadmap](#post-phase-6-roadmap)
+8. [Appendix](#appendix)
+9. [References](#references)
+10. [Revision History](#revision-history)
 
 ---
 
 ## Executive Summary
 
-This document outlines a phased approach to implementing Niyanta, a distributed workload processing system. The plan is structured to deliver incremental value while managing technical risk.
+This document outlines a phased approach to implementing Niyanta as a self-orchestrated ingestion platform backed by a distributed activity execution system. The plan is structured to deliver incremental value while managing technical risk, and is reframed around the activity model defined in [ADR-005](adr/ADR-005-activity-execution-model.md). The ingestion control-plane shape is defined in [INGESTION_ARCHITECTURE.md](INGESTION_ARCHITECTURE.md).
 
 ### Key Objectives
-1. Deliver a working MVP in 8-10 weeks **with affinity support**
-2. Achieve production-readiness in 16-20 weeks **with auto-scaling**
-3. Support 100+ concurrent workloads with < 99.5% uptime by Phase 2
-4. **Scale to 10,000 concurrent workloads** with 99.9% uptime by Phase 4
-5. **Support affinity-based workload placement** (GPU, region, compliance) from Phase 1
-6. **Implement SLA-based priority scheduling** with starvation prevention by Phase 2
+
+1. **Phase 1 MVP**: Single-attempt activities with framework-managed retries, persisted in Postgres. End-to-end: submit → execute → complete, with crash recovery and minimal attempt observability.
+2. **Phase 2**: Multi-process (coordinator + workers over NATS), with worker failure detection, redistribution, and connector runtime capability advertising.
+3. **Phase 3**: Sub-activities via `RunChild` with replay-based resume across `RunChild` boundaries — the mechanism needed for ingestion supervisors to compose plan/read/transform/deliver/commit steps.
+4. **Phase 4**: Deterministic primitives (`ctx.Sleep`, `ctx.Now`, `ctx.NewID`) and `SignalBus` (Postgres-backed). After Phase 4 the self-orchestrated ingestion loop is expressible: supervisors can sleep, wake on signals, run child partitions, and resume after crashes.
+5. **Phase 5**: Production ingestion shape — connector definitions/connections, ingestion planner, full REST API, multi-tenant auth, high-density shared execution, isolation policies, rate limiting, observability stack, audit, backpressure.
+6. **Phase 6**: Coordinator HA, adaptive planner sharding, auto-scaling, NATS JetStream `SignalBus`, determinism linter, chaos testing, scale tuning to 10K concurrent activities.
+
+### What changed from v1
+
+- The `Workload` interface (with author-managed `Checkpoint()`) is replaced by the `Activity` interface with framework-managed retries, replay-based resume, and suspend-on-`RunChild`. Authors do not write retry loops or design checkpoint state in the common case.
+- **Signals are now Phase 4, not Phase 3.** The agentic-monitor use case is unworkable without them; deferring is no longer an option. They are abstracted behind a `SignalBus` interface so the substrate (Postgres LISTEN/NOTIFY → NATS JetStream) can change without touching activity code.
+- **Affinity and priority are deferred.** v1 made these Phase 1; the activity model is itself the Phase 1 lift, and squeezing both in produced an 8-week MVP with no real safety margin. Affinity moves to Phase 2 (alongside multi-worker, where it actually matters), priority to Phase 5 (alongside multi-tenant, where SLA tiers become meaningful).
+- **Phases 0–4 are sized for a single engineer.** The team-size and cost columns from v1 reflected a multi-engineer org plan; that view is preserved in §[Resource Requirements](#resource-requirements) but the build sequence below assumes solo or small-team execution.
 
 ### Phases Overview
 
-| Phase | Duration | Key Deliverables | Team Size |
-|-------|----------|------------------|-----------|
-| Phase 0 | 2 weeks | Project setup, tooling, infrastructure | 2-3 engineers |
-| Phase 1 | 6-8 weeks | MVP: Single coordinator, basic worker, simple scheduler | 3-4 engineers |
-| Phase 2 | 8-10 weeks | HA coordinator, robust error handling, observability | 4-5 engineers |
-| Phase 3 | 6-8 weeks | Advanced scheduling, auto-scaling, multi-region prep | 4-5 engineers |
-| Phase 4 | Ongoing | Performance optimization, scale testing, cost optimization | 3-4 engineers |
+| Phase | Duration (solo) | Key Deliverables |
+|-------|------|------------------|
+| Phase 0 | 1 week | Project skeleton, all interfaces stubbed, in-memory impls, single-binary demo |
+| Phase 1 | 2 weeks | Postgres-backed `Activity` execution. Framework-managed retries. Survives restart. |
+| Phase 2 | 2 weeks | Coordinator + worker split, NATS broker, multi-worker, failure redistribution. Affinity. |
+| Phase 3 | 3 weeks | `RunChild` + replay-based resume. Sequential sub-activities. |
+| Phase 4 | 3 weeks | `ctx.Sleep`, `ctx.Now`, `ctx.NewID`. `SignalBus` interface + Postgres impl. `ctx.AwaitSignal`. |
+| Phase 5 | 3 weeks | Connector API, ingestion planner, customer/auth, isolation policy, dense shared execution, observability, audit, priority scheduling. |
+| Phase 6 | open-ended | Coordinator HA, adaptive planner sharding, NATS JetStream `SignalBus`, auto-scaling, determinism lint, chaos, scale tuning. |
 
-**Total Time to Production**: ~16-20 weeks (Phases 0-2)
+**Stop point for prototypes**: end of Phase 4. The activity substrate can express self-orchestrated ingestion + agentic monitors at this point, but connector registry/planner APIs arrive in Phase 5.
+
+**Stop point for production**: end of Phase 5. Phase 6 is incremental hardening.
+
+**Total time to use-case parity (solo)**: ~11 weeks (Phases 0–4).
+**Total time to production (solo)**: ~14 weeks (Phases 0–5).
 
 ---
 
 ## Development Phases
 
-### Phase 0: Foundation & Setup
-**Goal**: Set up development environment, tooling, and infrastructure foundation
+The phases are designed so that **each one ends with a runnable system**. If you stop after phase N, what you have works for what phase N promises — no half-built state.
 
-**Duration**: 2 weeks
+### Guiding principles
 
-**Key Deliverables**:
-- ✅ Repository structure and build system
-- ✅ CI/CD pipelines
-- ✅ Development and staging environments
-- ✅ Database schema migrations
-- ✅ Logging and metrics infrastructure
+1. **Interfaces from day one.** Every storage and broker concern lives behind an interface starting in Phase 0. Phase 1's Postgres impl can be swapped for Phase 6's JetStream impl without touching activity code. Six storage interfaces (`ActivityStore`, `AttemptStore`, `HeartbeatStore`, `ActivityCallStore`, `WorkerRegistry`, `LeaderElector`), one queue (`TaskQueue`), one signal bus (`SignalBus`), one event bus (`EventBus`). See [ADR-005](adr/ADR-005-activity-execution-model.md).
+2. **In-memory before external.** Phase 0 ships an in-memory implementation of every interface. End-to-end runs before any external dependency is introduced; design problems surface before infrastructure problems can hide them.
+3. **Vertical slices.** Don't build "all of storage" then "all of scheduler." Build one activity end-to-end (submit → schedule → execute → complete), then add features to that slice phase by phase.
+4. **Test what's invisible.** Replay, retry, and resume are invisible when they work. Failing tests come first: kill a worker mid-activity, drop a signal, time out a heartbeat. Make them pass.
 
 ---
 
-### Phase 1: MVP - Core Functionality with Affinity Support
-**Goal**: Build minimal viable product with core workload execution and affinity-based placement
+### Phase 0: End-to-end skeleton, in-memory only
 
-**Duration**: 6-8 weeks
+**Goal**: One process. One activity. Runs to completion. Everything behind interfaces. Zero external dependencies.
+
+**Duration**: 1 week (solo)
 
 **Key Deliverables**:
-- ✅ Single-instance coordinator with basic REST API **and backpressure**
-- ✅ Worker registration and heartbeat mechanism
-- ✅ **FIFO scheduler with full affinity support** (hard, soft, anti-affinity)
-- ✅ Workload execution framework with 1 sample workload type
-- ✅ Basic checkpoint and recovery (manual checkpoint only)
-- ✅ PostgreSQL state storage **with connection pooling and query optimization**
-- ✅ NATS broker integration
-- ✅ Health and metrics endpoints
-- ✅ **AffinityEvaluator for GPU, region, and compliance requirements**
+- Project skeleton per [impl/PHASE_0_SKELETON.md](impl/PHASE_0_SKELETON.md). Makefile (`build`, `test`, `lint`, `run`). golangci-lint config.
+- Domain models in `pkg/models/` — `Activity` (renamed from `Workload`), `ActivityAttempt`, `ActivityCall` (placeholder, populated in Phase 3), `Worker`, `Customer`, status enums.
+- `Activity` interface and `ActivityContext` in `pkg/activity/` with all methods declared from day one. `RunChild`, `Sleep`, `Now`, `NewID`, `AwaitSignal` stub-return `ErrNotImplemented` until their phases.
+- All eight storage/queue/bus interfaces declared in `internal/storage/`, `internal/broker/`, `internal/signal/`.
+- In-memory implementations of all interfaces (`internal/storage/memory/`, etc.) with shared contract tests.
+- Activity registry (`internal/registry/`) — type-name → factory function. Sample activity: `sleep`.
+- Single-process executor (`internal/executor/`) — pull from `TaskQueue`, run, write result. No retries yet, one at a time.
+- CLI (`cmd/niyanta/main.go`) with `submit`, `run`, `get` subcommands; Phase 0's demo runs all three in one binary.
 
 **Success Criteria**:
-- Submit a workload via API and execute successfully
-- Worker failure triggers redistribution within 2 minutes
-- Workload can checkpoint and resume on different worker
-- **GPU workloads are placed only on GPU workers** (hard affinity)
-- **Workloads prefer workers in same region** (soft affinity)
-- **Conflicting workloads avoid co-location** (anti-affinity)
-- **System handles 100+ concurrent workloads efficiently**
+- `niyanta demo sleep 2s` submits, runs, and reports completion using only in-memory state.
+- All interfaces have at least one impl and contract tests passing.
+- `go test ./...` and `golangci-lint run` clean.
+
+**Explicitly out of scope**: Postgres, NATS, HTTP, retries, `RunChild`, signals, multi-tenant, observability beyond stdlib `log`.
 
 ---
 
-### Phase 2: Production Hardening with Scale and Priority
-**Goal**: Make system production-ready with HA, observability, auto-scaling, and SLA-based scheduling
+### Phase 1: Persistence and framework-managed retries
 
-**Duration**: 10-12 weeks *(extended for priority and auto-scaling)*
+**Goal**: Same end-to-end flow as Phase 0, but the activity survives a process restart and retries on transient failure under a declared policy.
+
+**Duration**: 2 weeks (solo)
 
 **Key Deliverables**:
-- ✅ HA coordinator with leader election
-- ✅ Comprehensive observability (structured logging, distributed tracing, dashboards)
-- ✅ Retry logic with exponential backoff
-- ✅ Graceful shutdown for coordinators and workers
-- ✅ Multi-customer support with API key authentication
-- ✅ Rate limiting per customer tier
-- ✅ Audit event logging
-- ✅ **Priority scheduler with SLA tier-based weighting** (Free=1, Standard=10, Premium=50, Enterprise=100)
-- ✅ **Priority aging to prevent starvation** (boost by 5 per minute)
-- ✅ **Auto-scaling integration with Kubernetes HPA and EC2 ASG**
-- ✅ **Custom metrics exporter** (queue depth, worker utilization)
-- ✅ **Database read replica support** for query offloading
-- ✅ Deployment on Kubernetes with HPA
-- ✅ Load testing and performance benchmarking
-- ✅ Runbooks and operational documentation
+- Postgres implementations of `ActivityStore`, `AttemptStore`, `HeartbeatStore` in `internal/storage/postgres/`. `pgx/v5` directly, no ORM. Connection pool config in `internal/config/`.
+- Migrations via `golang-migrate`. Initial migration: `activities`, `activity_attempts`, `activity_heartbeats`, `workers`. Schema starts simpler than [DATA_MODELS.md](DATA_MODELS.md) — only what Phase 1 uses; later phases extend.
+- Postgres-polling `TaskQueue`. Pending attempts queried with `SELECT … FOR UPDATE SKIP LOCKED LIMIT 1` every 2s. Crude but adequate.
+- `RetryPolicy` declared per registered activity type: `MaxAttempts`, `InitialInterval`, `BackoffCoefficient`, `MaxInterval`, `NonRetryableErrors`. Framework enforces — activity code never retries itself.
+- Typed errors: `RetryableError`, `NonRetryableError`, classification helpers.
+- Per-attempt records (`activity_attempts` rows, not a `retry_count` column) — replaces the integer counter from v1's data model.
+- `ctx.Heartbeat(state)` writes to `activity_heartbeats`; `ctx.LastHeartbeat()` reads the latest for the current attempt.
+- Crash recovery on executor startup: claim any `state='RUNNING' AND worker_id=<self>` rows from a previous run, mark `INTERRUPTED`, enqueue a fresh attempt.
 
 **Success Criteria**:
-- System handles **1,000 concurrent workloads** across 50+ workers
-- 99.5% uptime over 2-week test period
-- Coordinator failover < 30 seconds
-- Worker failure detection < 60 seconds
-- API p95 latency < 100ms *(improved from 200ms)*
-- **Premium tier workloads scheduled before free tier** (SLA enforcement)
-- **No workload starves for > 30 minutes** (aging works)
-- **Auto-scaling responds within 5 minutes** to load increases
-- **Database handles 10,000 workload submissions/hour**
+- Submit a `flaky_sleep` activity (fails attempts 1 and 2, succeeds attempt 3). `psql` shows three `activity_attempts` rows; final state is `COMPLETED`.
+- Kill the executor mid-execution. Restart. Interrupted attempt is marked, new attempt enqueued, completes.
+- Migration up/down round-trip clean.
+
+**Explicitly out of scope**: Multi-worker, separate coordinator, NATS, `RunChild`, signals.
 
 ---
 
-### Phase 3: Advanced Features
-**Goal**: Implement advanced features, multi-region support, and customer-facing enhancements
+### Phase 2: Multi-process — coordinator + workers, NATS for control plane
 
-**Duration**: 6-8 weeks
+**Goal**: Coordinator and workers run as separate processes, possibly on different machines. Multiple workers. Worker failure detected and activities redistributed.
+
+**Duration**: 2 weeks (solo)
 
 **Key Deliverables**:
-- ✅ **Affinity tuning and optimization** *(core affinity already in Phase 1)*
-- ✅ Automatic checkpointing (time-based and progress-based)
-- ✅ Workload pause/resume via API
-- ✅ WebSocket API for real-time updates
-- ✅ Multi-region preparation (data model, API design, region-aware scheduling)
-- ✅ Go and Python SDKs
-- ✅ Interactive API documentation (Swagger UI)
+- Split binaries: `cmd/coordinator/`, `cmd/worker/`. Shared code in `internal/`.
+- NATS-backed `EventBus` in `internal/broker/nats/`. Channels per [ARCHITECTURE.md:280](ARCHITECTURE.md#L280): `worker.{id}.commands`, `worker.{id}.status`, `coordinator.events`. Reconnect logic, pub-with-retry.
+- Worker process: registers on startup, subscribes to its command channel, heartbeats every 30s with capacity + running-activity inventory.
+- Coordinator process: HTTP API for `submit/get/list/cancel` (minimal, no auth yet); scheduler loop every 5s; health monitor loop every 30s.
+- Worker failure detection: marks workers `DEAD` after 60s without heartbeat; `INTERRUPTED` their in-flight attempts; re-enqueues.
+- Lease + fence tokens: `lease_expires_at` on the attempt; `generation` on the activity; workers reject commands with stale generation. Resolves split-brain.
+- Affinity (hard, soft, anti-affinity) — moved here from v1 Phase 1 because affinity is meaningless with one worker. Implementation lives in `internal/scheduler/affinity.go` per [impl/PHASE_2_DISTRIBUTED_WORKERS.md](impl/PHASE_2_DISTRIBUTED_WORKERS.md). Soft affinity is scoring; hard is filter; anti-affinity needs `GetActivitiesByWorker` query.
+- docker-compose for local dev: postgres + nats + 1 coordinator + 2 workers.
 
 **Success Criteria**:
-- Affinity rules correctly place **99%** of workloads on preferred workers *(improved)*
-- **Complex affinity rules evaluate in < 100ms** (optimized)
-- SDK supports all core API operations
-- **Multi-region workloads prefer workers in same region as data**
+- `docker compose up` brings the whole system up.
+- Submit a 30s-sleep activity. `kill -9` the worker that picked it up. Activity is redistributed to another worker within 60s and completes.
+- `psql` shows the timeline: attempt 1 INTERRUPTED on worker-A, attempt 2 COMPLETED on worker-B.
+- Lease-expiration test: `SIGSTOP` a worker mid-attempt, lease expires, redistribution happens, `SIGCONT` the original worker, its commands are fenced off.
+- GPU-tagged activity (hard affinity) only lands on GPU-tagged workers.
+
+**Explicitly out of scope**: `RunChild`, signals, coordinator HA (single coordinator), priority, auth, rate limiting.
 
 ---
 
-### Phase 4: Scale & Optimization
-**Goal**: Optimize for large-scale deployments and cost efficiency
+### Phase 3: Sub-activities and replay-based resume
 
-**Duration**: Ongoing (8+ weeks initial sprint)
+**Goal**: A parent activity calls `ctx.RunChild(...)`. Parent suspends durably; child runs (in-process or remote — framework's choice); parent resumes via replay across attempts. Children with recorded results short-circuit on resume.
+
+**Duration**: 3 weeks (solo)
 
 **Key Deliverables**:
-- ✅ Database query optimization and indexing
-- ✅ Connection pooling and caching
-- ✅ Checkpoint compression and S3 offloading
-- ✅ Batch operations API
-- ✅ Multi-region deployment
-- ✅ Cost optimization (resource right-sizing, spot instances)
-- ✅ Advanced analytics and reporting
-- ✅ Chaos engineering and fault injection
+- `ActivityCallStore` interface + Postgres impl. New table `activity_calls(parent_attempt_id, call_index, child_activity_id, recorded_result, created_at)`.
+- `ctx.RunChild(activityType, input, opts)` semantics:
+  - Records call in `activity_calls`, dispatches child via `TaskQueue`, transitions parent attempt to `WAITING_CHILD`, frees parent's worker slot.
+  - On child completion, coordinator records result in `activity_calls`, transitions parent to `PENDING_RESUME`, enqueues a new parent attempt.
+  - On the new parent attempt, framework loads the call log; activity body re-executes from the top; each `RunChild` call checks the log and short-circuits with the recorded result, fast-forwarding to the next un-recorded call.
+- Call-index determinism: sequential `nextCallIndex()` counter per attempt. Runtime check on replay: if a logged call's type doesn't match the activity's call at the same index, fail loudly with a determinism-violation error.
+- Locality default: always remote (always dispatched via `TaskQueue`). In-process optimization deferred to a later phase.
+- Sample composite activities: `sequential_pipeline` (3 children combined), `flaky_pipeline` (children fail randomly, parent retries each via the resume mechanism).
+- Document the call-log + replay semantics fully in [impl/PHASE_3_CHILD_ACTIVITIES_REPLAY.md](impl/PHASE_3_CHILD_ACTIVITIES_REPLAY.md) before writing code — replay correctness is subtle.
 
 **Success Criteria**:
-- System handles 1000+ concurrent workloads
-- 99.9% uptime
-- API p95 latency < 100ms
-- Database can handle 10,000 workloads/hour submission rate
-- Cost per workload reduced by 30% from Phase 2
+- Submit `sequential_pipeline` with 3 children. `psql` timeline shows: parent attempt 1 dispatches child 0 → suspends; child 0 completes; parent attempt 2 replays past child 0 (instant), dispatches child 1 → suspends; ... ; parent attempt 4 replays past all three, returns the combined result.
+- Kill the worker holding the parent during attempt N. New worker picks up the parent, replays through completed children (each in microseconds), continues from where it left off.
+- Each child runs exactly once across all parent attempts.
+- Determinism-violation test: an activity that randomly skips a `RunChild` on replay → framework detects and fails the activity with a clear error.
+
+**Explicitly out of scope**: `Sleep`, `Now`, `NewID`, signals, in-process child optimization.
 
 ---
 
-## Phase 0: Foundation & Setup
+### Phase 4: Deterministic primitives and signals
 
-### Work Items
+**Goal**: Activities can sleep for hours, wake on time, and respond to external signals. After this phase, multi-day agentic monitors and ingestion pipelines are fully expressible.
 
-#### 0.1 Repository & Project Structure
-**Owner**: Tech Lead
-**Duration**: 2 days
+**Duration**: 3 weeks (solo)
 
-**Tasks**:
-- [ ] Initialize Go module (`go mod init github.com/yourusername/niyanta`)
-- [ ] Create directory structure:
+**Key Deliverables**:
+- `ctx.Now()`, `ctx.NewID()` — recorded into the call log on first call within an attempt; replayed thereafter. Implemented as synthetic call-log entries (`_now`, `_id`).
+- `ctx.Sleep(duration)` — durable. Records `_sleep` with `wake_at = now + d`. Suspends parent. Coordinator-side timer wheel (a `pending_timers(activity_id, wake_at)` table with index on `wake_at`, polled every second) wakes activities at their scheduled time. Multi-day sleeps cost no worker resources.
+- `SignalBus` interface in `internal/signal/`:
+  ```go
+  type SignalBus interface {
+      Send(ctx context.Context, activityID, name string, payload []byte) error
+      AwaitForActivity(ctx context.Context, activityID, name string) ([]byte, error)
+  }
   ```
-  niyanta/
-  ├── cmd/
-  │   ├── coordinator/
-  │   └── worker/
-  ├── internal/
-  │   ├── coordinator/
-  │   ├── worker/
-  │   ├── broker/
-  │   ├── storage/
-  │   └── models/
-  ├── pkg/
-  │   └── api/
-  ├── api/
-  │   ├── openapi/
-  │   └── proto/
-  ├── deployments/
-  │   ├── kubernetes/
-  │   └── terraform/
-  ├── scripts/
-  ├── docs/
-  └── tests/
-  ```
-- [ ] Set up Makefile with common commands (build, test, lint, run)
-- [ ] Configure `.gitignore` for Go projects
-- [ ] Set up Go linter (golangci-lint) configuration
-- [ ] Create README with getting started instructions
+  Signal substrate is fully abstracted — Phase 4 ships a Postgres-backed impl, Phase 6 adds a JetStream-backed alternative without API changes.
+- Postgres `SignalBus` impl: `signals(id, activity_id, name, payload, delivered_at, created_at)`. `Send` inserts + `NOTIFY signal_arrived, '<activity_id>'`. Coordinator owns the LISTEN connection; pushes deliveries to waiting parents via internal channels. (Single-coordinator constraint; HA in Phase 6 requires the JetStream variant.)
+- `ctx.AwaitSignal(name, timeout)` — same suspend-and-resume pattern as `RunChild`. Records `_await_signal(name, timeout)` in call log. Coordinator parks the parent until signal arrives or timeout fires.
+- Signal addressing: external clients send via API `POST /v1/activities/{id}/signals/{name}`. Activities can also send via `ctx.SendSignal(target_id, name, payload)`.
+- Sample agentic-monitor activity: `for { ctx.AwaitSignal("alert", 24*time.Hour); ctx.RunChild("evaluate_and_decide", ...); }`. Demonstrates multi-day lifetime.
+- [impl/PHASE_4_TIMERS_SIGNALS.md](impl/PHASE_4_TIMERS_SIGNALS.md) written before code — delivery semantics, mailbox storage, race handling.
 
-**Deliverable**: Repository with initial structure and build tooling
+**Success Criteria**:
+- Submit a monitor activity. Don't touch it for hours. Send a signal. Activity wakes, runs a child, suspends again. Kill all workers. Restart. Send another signal. Wakes correctly.
+- Signal delivered before parent suspends (race) — not lost.
+- Signal delivered while no worker holds the parent — persisted, delivered on resume.
+- Timeout: `AwaitSignal` with 5s timeout, no signal sent → timeout error returned.
+- Replay correctness: parent that already received signal X, on replay, returns the same payload X without re-awaiting.
+- Long sleep test: `ctx.Sleep(48h)` — fast-forward variant exercises the timer wheel without waiting 48 hours.
+
+**Explicitly out of scope**: NATS-backed `SignalBus`, determinism linter, coordinator HA. Phase 4 relies on author discipline for the determinism rule.
+
+**Stop point for prototype use**: The system supports your stated use cases (ingestion + agentic monitors) at this point. Phases 5 and 6 are productionization.
 
 ---
 
-#### 0.2 CI/CD Pipeline
-**Owner**: DevOps Engineer
-**Duration**: 3 days
+### Phase 5: Production ingestion shape — connectors, planner, API, observability
 
-**Tasks**:
-- [ ] Set up GitHub Actions workflows:
-  - [ ] `ci.yml`: Run tests, linting, and build on every PR
-  - [ ] `cd.yml`: Deploy to staging on merge to `main`
-  - [ ] `release.yml`: Build and tag Docker images on version tags
-- [ ] Configure Docker build for coordinator and worker
-- [ ] Set up container registry (Docker Hub, ECR, or GCR)
-- [ ] Create staging environment deployment pipeline
+**Goal**: Turn the durable activity substrate into the actual ingestion product: connector definitions, customer connections, ingestion planner, self-orchestrated runs, customer/auth, dense shared execution, isolation policies, structured logs/metrics/traces, rate limiting, audit, backpressure, and priority scheduling.
 
-**Deliverable**: Automated CI/CD pipelines
+**Duration**: 3 weeks (solo)
 
----
+**Key Deliverables**:
+- Connector definition and connection APIs per [DATA_CONNECTOR_SPEC.md](DATA_CONNECTOR_SPEC.md): create/list/get/update/test/run/pause/resume.
+- Connector registry and connection manager tables: definitions, versions, customer connections, secret refs, destinations, health state.
+- Isolation policy model: shared, pooled, and dedicated worker placement; tenant-scoped state, secret refs, destination refs, checkpoints, dedupe state, logs, metrics, and traces.
+- Customer ingestion operations: CID-scoped ingestion view, significant event filters, active connection controls, rate-limit overrides, and temporary disable controls for erring connections.
+- Operational failure semantics from [OPERATIONS_AND_FAILURE_SEMANTICS.md](OPERATIONS_AND_FAILURE_SEMANTICS.md): at-least-once delivery, checkpoint-after-confirmed-ingestion, dead-letter sinks, connector spec versioning, secret-rotation wakeups, backfill isolation, and blast-radius controls.
+- Ingestion planner loop from [INGESTION_ARCHITECTURE.md](INGESTION_ARCHITECTURE.md): schedules, lag, checkpoint state, backfills, source rate limits, destination backpressure, and health policy produce `ConnectorRun` records and activity attempts.
+- Initial declarative `poll_http` runtime: API key/basic/OAuth2 client credentials, JSON response extraction, time-window checkpoints, batching, and at-least-once delivery.
+- Connection supervisor semantics using `ctx.Sleep` and `ctx.AwaitSignal`: config changes, backfills, and manual run requests wake the supervisor.
+- Full REST API per [API_SPEC.md](API_SPEC.md), with `workloads` renamed to `activities` throughout. Activity submit/get/list/cancel/pause/resume; logs; audit trail; customer info; usage stats; health/ready/metrics endpoints.
+- API key authentication per [API_SPEC.md:33-50](API_SPEC.md#L33-L50). Hashed in DB. Customer extraction middleware. All queries filter by `customer_id`.
+- Backpressure: queue-depth check on submit; 503 with `Retry-After` when at customer's queue limit.
+- Rate limiting: token bucket per customer, tier-based limits per [DATA_MODELS.md:120-126](DATA_MODELS.md#L120-L126).
+- Priority scheduler with SLA tier weights (Free=1, Standard=10, Premium=50, Enterprise=100) and aging to prevent starvation (boost +5 priority per minute of wait). Moved here from v1 Phase 2 because tiers are meaningless without multi-tenant.
+- Structured logging (zap or zerolog) with correlation IDs across connection → run → activity → attempt → call.
+- Prometheus metrics from [ARCHITECTURE.md](ARCHITECTURE.md). Per-customer, per-connector, per-connection, per-activity-type counters/histograms. Queue depth, source lag, checkpoint age, destination latency, and worker utilization gauges (sets up Phase 6 auto-scaling).
+- OpenTelemetry tracing. Span per connector supervisor, planner cycle, activity, attempt, source read, transform, destination flush, checkpoint commit, and `RunChild`. Trace context propagation through `ActivityContext`.
+- Audit events table per [DATA_MODELS.md:357-372](DATA_MODELS.md#L357-L372). Async writer (channel + worker goroutine) so audit doesn't block hot path.
 
-#### 0.3 Infrastructure Setup
-**Owner**: DevOps Engineer + Backend Engineer
-**Duration**: 5 days
+**Success Criteria**:
+- Create a `poll_http` connector definition and customer connection. The planner creates runs without manual workload submission.
+- A connection supervisor sleeps, wakes for its next poll, processes data, commits checkpoint, and schedules the next run.
+- Manual backfill uses an isolated checkpoint namespace and does not corrupt live ingestion.
+- Checkpoints are committed only after confirmed destination delivery.
+- Dead-letter records can be written to file/object storage or stream destinations according to policy.
+- Secret updates wake affected connection supervisors and the next run resolves the rotated secret.
+- Source 429 triggers backoff; repeated auth failure quarantines the connection; both are visible in health state.
+- Submit via `curl` with API key. Poll. Receive completion.
+- Two customers' activities are isolated in queries, metrics, and rate limits.
+- Shared worker pool runs multiple tenants densely while respecting per-tenant concurrency, queue, source, and destination limits.
+- Dedicated isolation mode routes a selected connection only to an approved worker pool.
+- A CID ingestion view shows connection health, active controls, significant events, source lag, checkpoint age, and run metrics.
+- Significant event filters can mark source throttling, auth failure, parser drops, destination failure, and checkpoint-age events.
+- Operators can apply a temporary rate limit or temporary disable to an erring connection, and the planner respects it before creating new runs.
+- Premium tier activity submitted after free tier activity executes first.
+- No activity in the queue starves longer than 30 minutes (aging).
+- Rate-limit and backpressure paths exercised — correct status codes, headers, `Retry-After`.
+- Grafana dashboard shows per-customer and per-connection throughput/lag/drop rate; Jaeger trace spans full lifecycle including planner, source read, destination flush, checkpoint commit, and `RunChild`.
 
-**Tasks**:
-- [ ] Provision PostgreSQL database (RDS or CloudSQL for dev/staging)
-- [ ] Set up NATS cluster (3 nodes for dev/staging)
-- [ ] Configure Prometheus + Grafana for metrics
-- [ ] Set up ELK/Loki stack for centralized logging
-- [ ] Create Kubernetes namespace and base resources
-- [ ] Set up Terraform/Pulumi for infrastructure as code
-- [ ] Configure secrets management (Kubernetes Secrets / AWS Secrets Manager)
-
-**Deliverable**: Dev and staging infrastructure ready
-
----
-
-#### 0.4 Database Schema & Migrations
-**Owner**: Backend Engineer
-**Duration**: 3 days
-
-**Tasks**:
-- [ ] Set up migration tool (golang-migrate or Goose)
-- [ ] Implement SQL schemas from [DATA_MODELS.md](DATA_MODELS.md):
-  - [ ] `customers` table
-  - [ ] `workload_configs` table
-  - [ ] `workloads` table
-  - [ ] `workers` table
-  - [ ] `checkpoints` table
-  - [ ] `audit_events` table
-  - [ ] `coordinator_state` table
-- [ ] Create indexes as specified
-- [ ] Write migration tests (up/down)
-- [ ] Seed sample data for development
-
-**Deliverable**: Database schema with versioned migrations
+**Explicitly out of scope**: Coordinator HA; NATS JetStream `SignalBus`; auto-scaling integration (the metrics that enable it ship here, the integration ships in Phase 6).
 
 ---
 
-#### 0.5 Observability Foundation
-**Owner**: Backend Engineer
-**Duration**: 2 days
+### Phase 6: HA, scale, hardening
 
-**Tasks**:
-- [ ] Integrate structured logging library (zap or zerolog)
-- [ ] Set up Prometheus metrics client
-- [ ] Create common logging helpers (with correlation IDs)
-- [ ] Define initial metrics (counters, histograms, gauges)
-- [ ] Set up distributed tracing (Jaeger or Honeycomb)
-- [ ] Create Grafana dashboard templates
+**Goal**: Coordinator HA, NATS JetStream `SignalBus`, auto-scaling, determinism linter, chaos testing, scale to the targets in [ARCHITECTURE.md:693-702](ARCHITECTURE.md#L693-L702).
 
-**Deliverable**: Logging, metrics, and tracing infrastructure
+**Duration**: open-ended; tackle items selectively based on actual scale needs.
 
----
+**Key Deliverables**:
+- Coordinator HA via `LeaderElector`. Pick one mechanism (Postgres advisory lock *or* etcd) and align architecture/data-model docs with [impl/PHASE_6_HA_SCALE_HARDENING.md](impl/PHASE_6_HA_SCALE_HARDENING.md). Followers serve API; leader runs scheduler, health monitor, timer wheel, signal listener. Generation tokens prevent split-brain.
+- NATS JetStream-backed `SignalBus` impl as alternative behind the same interface. Removes the LISTEN/NOTIFY single-coordinator bottleneck — required for true HA.
+- Auto-scaling: custom Prometheus metrics adapter, Kubernetes HPA manifests, queue-depth- and utilization-based scaling per [impl/PHASE_6_HA_SCALE_HARDENING.md](impl/PHASE_6_HA_SCALE_HARDENING.md).
+- Determinism linter: static analysis catching direct use of `time.Now()`, `rand.*`, file/network I/O in any package whose activities call `RunChild` (or other suspend points). Run in CI.
+- Chaos testing: random worker kills, leader kills, NATS message drops, brief Postgres pauses. Verify SLOs hold — no lost activities, bounded retry duplication, exactly-once-per-instance signal delivery.
+- Performance work: load test to architecture targets (10K concurrent activities, p95 latency, etc.). Profile and fix hot spots. Database indexes per actual query patterns.
+- Heartbeat S3 offload via a `BlobStore` interface — for activities with large heartbeat payloads (> threshold), payload goes to S3 with pointer in `activity_heartbeats`. Resolves the Postgres-bytea concern from architectural review.
+- Database read replicas for query offloading at scale (> 5K concurrent activities). Read/write splitting belongs in [impl/PHASE_6_HA_SCALE_HARDENING.md](impl/PHASE_6_HA_SCALE_HARDENING.md) — `GetPendingActivities`, list endpoints, `GetActivity` go to replica; writes go to primary.
 
-## Phase 1: MVP - Core Functionality
-
-### Work Items
-
-#### 1.1 Coordinator - Core Framework
-**Owner**: Backend Engineer
-**Duration**: 5 days
-
-**Tasks**:
-- [ ] Implement coordinator main entry point (`cmd/coordinator/main.go`)
-- [ ] Set up HTTP server with graceful shutdown
-- [ ] Implement configuration loading (viper or similar)
-- [ ] Create database connection pool
-- [ ] Implement NATS client connection
-- [ ] Add health check endpoint (`/health`, `/ready`)
-- [ ] Add metrics endpoint (`/metrics`)
-- [ ] Write unit tests for core framework
-
-**Deliverable**: Coordinator process that starts and handles basic HTTP requests
+**Success Criteria**:
+- Kill the leader coordinator: failover within 30s, no activity progress lost, no duplicate execution.
+- Sustained 1000 activities/min with no errors over 24h.
+- HPA scales workers up under load and down when idle.
+- Determinism lint catches a deliberately-broken activity in CI.
+- Chaos run: 1-hour scenario with random faults injected; system recovers within SLO; activity correctness preserved.
 
 ---
 
-#### 1.2 Coordinator - API Server with Backpressure
-**Owner**: Backend Engineer
-**Duration**: 7 days
-
-**Tasks**:
-- [ ] Implement REST API handlers (using Gin or Echo framework):
-  - [ ] `POST /v1/workloads` - Submit workload **with backpressure check**
-  - [ ] `GET /v1/workloads/{id}` - Get workload status
-  - [ ] `GET /v1/workloads` - List workloads
-  - [ ] `POST /v1/workloads/{id}/cancel` - Cancel workload
-  - [ ] **[NEW]** `GET /v1/metrics/queue-depth` - Queue depth endpoint for monitoring
-- [ ] Implement API key authentication middleware
-- [ ] Add request validation (using validator library)
-- [ ] Implement error handling and standard error responses
-- [ ] Add request ID tracking for correlation
-- [ ] **[CRITICAL]** Implement backpressure mechanism:
-  - [ ] Check queue depth before accepting workload submission
-  - [ ] Return HTTP 503 when at capacity with retry-after header
-  - [ ] Per-customer queue depth limits enforcement
-- [ ] Write integration tests for API endpoints including backpressure scenarios
-
-**Deliverable**: Functioning REST API with backpressure to prevent overload
-
-**See Also**: [impl/10_API_HANDLERS.md](impl/10_API_HANDLERS.md) for complete implementation details
-
----
-
-#### 1.3 Coordinator - State Manager with Connection Pooling
-**Owner**: Backend Engineer
-**Duration**: 6 days
-
-**Tasks**:
-- [ ] Implement database models (using pgx/v5 for better performance)
-- [ ] **[CRITICAL]** Configure connection pooling for scale:
-  - [ ] MaxConnections: 20 (MVP), 100+ (production)
-  - [ ] MinConnections: 5
-  - [ ] MaxConnLifetime: 30 minutes
-  - [ ] MaxConnIdleTime: 5 minutes
-  - [ ] HealthCheckInterval: 1 minute
-- [ ] Create state manager interface and implementation:
-  - [ ] `CreateWorkload()`
-  - [ ] `GetWorkload()`
-  - [ ] `UpdateWorkloadStatus()`
-  - [ ] `UpdateWorkloadStatusBatch()` - for batch updates
-  - [ ] `ListWorkloads()`
-  - [ ] `GetPendingWorkloads()` - with prepared statement and timeout
-  - [ ] **[NEW]** `GetWorkloadsByWorker()` - for anti-affinity checks
-  - [ ] **[NEW]** `GetQueueDepth()` - for monitoring and backpressure
-  - [ ] **[NEW]** `GetAvailableWorkers()` - with capacity filtering
-- [ ] Implement transaction wrappers for atomic operations
-- [ ] Add database connection retry logic with exponential backoff
-- [ ] **[CRITICAL]** Add query optimizations:
-  - [ ] Prepared statements for frequent queries
-  - [ ] Query timeouts (5s default)
-  - [ ] Connection context management
-- [ ] Write unit tests with mocked database
-- [ ] Write integration tests with test database
-
-**Deliverable**: High-performance state management layer with connection pooling and query optimization
-
-**See Also**: [impl/04_STATE_MANAGER.md](impl/04_STATE_MANAGER.md) for complete implementation details
-
----
-
-#### 1.4 Coordinator - Simple Scheduler with Affinity Support
-**Owner**: Backend Engineer
-**Duration**: 7 days
-
-**Tasks**:
-- [ ] Implement FIFO scheduler with configurable batch size (100 for MVP)
-- [ ] Create scheduler loop (runs every 5 seconds)
-- [ ] **[CRITICAL]** Implement AffinityEvaluator for workload placement:
-  - [ ] Hard affinity evaluation (worker tags, worker ID, capabilities)
-  - [ ] Soft affinity scoring (0-100 score for preference matching)
-  - [ ] Anti-affinity checks (query running workloads on worker)
-- [ ] Implement worker selection with affinity:
-  - [ ] Filter by capacity and capability
-  - [ ] Enforce hard affinity (must match)
-  - [ ] Check anti-affinity (avoid conflicts)
-  - [ ] Score soft affinity (select best match)
-- [ ] Update workload status (PENDING → SCHEDULED)
-- [ ] Send workload assignment message to worker via NATS
-- [ ] Handle worker unavailability (retry logic)
-- [ ] Add scheduler metrics (queue depth, scheduling latency, affinity match rate)
-- [ ] **[CRITICAL]** Add database query optimization:
-  - [ ] Prepared statement for GetPendingWorkloads
-  - [ ] Partial index on workloads(customer_id, priority DESC, created_at) WHERE status='PENDING'
-  - [ ] Query timeout (5s default)
-- [ ] Write unit tests for scheduling logic including affinity scenarios
-
-**Deliverable**: FIFO scheduler with full affinity support (hard, soft, anti-affinity) that assigns workloads to suitable workers
-
-**See Also**: [impl/06_SCHEDULER.md](impl/06_SCHEDULER.md) for complete implementation details
-
----
-
-#### 1.5 Coordinator - Worker Health Monitor
-**Owner**: Backend Engineer
-**Duration**: 4 days
-
-**Tasks**:
-- [ ] Implement worker registration handler (NATS message)
-- [ ] Store worker state in database
-- [ ] Implement heartbeat processor (NATS message)
-- [ ] Update `last_heartbeat` timestamp in database
-- [ ] Create health monitor loop (runs every 30 seconds)
-- [ ] Detect workers with missed heartbeats (> 60s)
-- [ ] Mark workers as DEAD
-- [ ] Trigger workload redistribution for dead workers
-- [ ] Write unit tests
-
-**Deliverable**: Worker health monitoring and failure detection
-
----
-
-#### 1.6 Worker - Core Framework
-**Owner**: Backend Engineer
-**Duration**: 5 days
-
-**Tasks**:
-- [ ] Implement worker main entry point (`cmd/worker/main.go`)
-- [ ] Set up configuration loading
-- [ ] Implement database connection (read-only for checkpoints/config)
-- [ ] Implement NATS client connection
-- [ ] Generate unique worker ID on startup
-- [ ] Implement worker registration on boot (send message to coordinator)
-- [ ] Add health check endpoint (`/health`, `/ready`)
-- [ ] Add metrics endpoint (`/metrics`)
-
-**Deliverable**: Worker process that starts and registers with coordinator
-
----
-
-#### 1.7 Worker - Workload Execution Engine
-**Owner**: Backend Engineer
-**Duration**: 7 days
-
-**Tasks**:
-- [ ] Define `Workload` interface (Init, Execute, Checkpoint, Close)
-- [ ] Implement workload plugin loader (registry pattern)
-- [ ] Create workload execution context with cancellation
-- [ ] Implement goroutine pool for concurrent workload execution
-- [ ] Handle workload assignment message from NATS
-- [ ] Load workload config and input params from database
-- [ ] Execute workload in isolated goroutine
-- [ ] Handle workload completion (success/failure)
-- [ ] Send completion message to coordinator via NATS
-- [ ] Update workload status in database
-- [ ] Add execution metrics (duration, success/failure counts)
-
-**Deliverable**: Worker can execute workloads based on coordinator assignments
-
----
-
-#### 1.8 Worker - Checkpoint Manager
-**Owner**: Backend Engineer
-**Duration**: 4 days
-
-**Tasks**:
-- [ ] Implement manual checkpoint creation (workload calls Checkpoint())
-- [ ] Serialize checkpoint data (using gob or protobuf)
-- [ ] Store checkpoint in database with sequence number
-- [ ] Implement checkpoint restoration on workload Init()
-- [ ] Load latest checkpoint from database
-- [ ] Pass checkpoint data to workload Init()
-- [ ] Handle checkpoint errors gracefully
-- [ ] Add checkpoint metrics (size, frequency)
-
-**Deliverable**: Checkpoint creation and restoration mechanism
-
----
-
-#### 1.9 Worker - Heartbeat Sender
-**Owner**: Backend Engineer
-**Duration**: 2 days
-
-**Tasks**:
-- [ ] Implement heartbeat loop (sends message every 30 seconds)
-- [ ] Include worker status, capacity, and running workload list
-- [ ] Send heartbeat message to coordinator via NATS
-- [ ] Handle NATS disconnection and reconnection
-- [ ] Add heartbeat metrics (interval, failure count)
-
-**Deliverable**: Worker sends periodic heartbeats to coordinator
-
----
-
-#### 1.10 Sample Workload Implementation
-**Owner**: Backend Engineer
-**Duration**: 3 days
-
-**Tasks**:
-- [ ] Implement sample "sleep" workload (simulates long-running work)
-- [ ] Implement Init() - parse config and checkpoint
-- [ ] Implement Execute() - sleep with periodic progress updates
-- [ ] Implement Checkpoint() - serialize current progress
-- [ ] Implement Close() - cleanup resources
-- [ ] Register workload in worker plugin registry
-- [ ] Create workload config in database seed data
-- [ ] Write unit tests for workload
-
-**Deliverable**: Sample workload type for testing end-to-end flow
-
----
-
-#### 1.11 Broker Integration
-**Owner**: Backend Engineer
-**Duration**: 3 days
-
-**Tasks**:
-- [ ] Implement NATS client wrapper (publish, subscribe, request-reply)
-- [ ] Define message envelope structure (see DATA_MODELS.md)
-- [ ] Implement message serialization/deserialization (JSON)
-- [ ] Add retry logic for failed publishes
-- [ ] Handle NATS disconnection gracefully
-- [ ] Add broker metrics (message counts, latency)
-- [ ] Write unit tests with NATS test server
-
-**Deliverable**: Reliable broker communication layer
-
----
-
-#### 1.12 End-to-End Testing
-**Owner**: QA Engineer + Backend Engineer
-**Duration**: 5 days
-
-**Tasks**:
-- [ ] Set up local test environment (docker-compose with all components)
-- [ ] Write E2E test: Submit workload → Execute → Complete
-- [ ] Write E2E test: Worker failure → Redistribution → Resume
-- [ ] Write E2E test: Manual checkpoint → Worker restart → Resume
-- [ ] Document test scenarios
-- [ ] Create test automation scripts
-
-**Deliverable**: Automated E2E test suite
-
----
-
-#### 1.13 MVP Documentation
-**Owner**: Tech Lead
-**Duration**: 2 days
-
-**Tasks**:
-- [ ] Write getting started guide
-- [ ] Document API endpoints (OpenAPI spec)
-- [ ] Create sample API requests (Postman collection)
-- [ ] Document deployment instructions
-- [ ] Create troubleshooting guide
-
-**Deliverable**: User-facing MVP documentation
-
----
-
-## Phase 2: Production Hardening
-
-### Work Items
-
-#### 2.1 HA Coordinator - Leader Election
-**Owner**: Backend Engineer
-**Duration**: 5 days
-
-**Tasks**:
-- [ ] Implement leader election using PostgreSQL advisory locks
-- [ ] Create leader election loop
-- [ ] Acquire lock with TTL, renew every 5 seconds
-- [ ] Handle lock loss (step down as leader)
-- [ ] Only run scheduler and health monitor on leader
-- [ ] Add generation number to prevent split-brain
-- [ ] Add leader election metrics
-- [ ] Write unit tests for election logic
-
-**Deliverable**: Multi-instance coordinator with automatic failover
-
----
-
-#### 2.2 Comprehensive Observability
-**Owner**: Backend Engineer + DevOps
-**Duration**: 7 days
-
-**Tasks**:
-- [ ] Enhance structured logging:
-  - [ ] Add correlation IDs to all logs
-  - [ ] Include customer_id, workload_id in context
-  - [ ] Add log sampling for high-volume events
-- [ ] Expand metrics:
-  - [ ] Per-customer workload counts
-  - [ ] Latency histograms (submission, scheduling, execution)
-  - [ ] Error rates by type
-  - [ ] Queue depth by priority
-- [ ] Implement distributed tracing:
-  - [ ] Trace workload submission through completion
-  - [ ] Add spans for database queries, broker messages
-- [ ] Create Grafana dashboards:
-  - [ ] System overview (workload throughput, error rate)
-  - [ ] Per-customer dashboard
-  - [ ] Worker health dashboard
-- [ ] Set up alerting rules in Prometheus
-
-**Deliverable**: Production-grade observability stack
-
----
-
-#### 2.3 Retry Logic & Error Handling
-**Owner**: Backend Engineer
-**Duration**: 5 days
-
-**Tasks**:
-- [ ] Implement retry logic for transient errors:
-  - [ ] Database connection failures
-  - [ ] NATS publish failures
-  - [ ] Workload execution failures (configurable per workload type)
-- [ ] Add exponential backoff with jitter
-- [ ] Distinguish transient vs. permanent errors
-- [ ] Implement circuit breaker for cascading failures
-- [ ] Add retry metrics (attempt counts, backoff duration)
-- [ ] Write unit tests for retry scenarios
-
-**Deliverable**: Robust error handling and retry mechanisms
-
----
-
-#### 2.4 Graceful Shutdown
-**Owner**: Backend Engineer
-**Duration**: 3 days
-
-**Tasks**:
-- [ ] Implement coordinator graceful shutdown:
-  - [ ] Stop accepting new API requests
-  - [ ] Complete in-flight scheduler iterations
-  - [ ] Release leader lock
-  - [ ] Close database and NATS connections
-- [ ] Implement worker graceful shutdown:
-  - [ ] Send DRAINING status to coordinator
-  - [ ] Stop accepting new workloads
-  - [ ] Checkpoint all running workloads
-  - [ ] Wait for workloads to pause (with timeout)
-  - [ ] Close connections
-- [ ] Add shutdown timeout configuration
-- [ ] Test shutdown scenarios (SIGTERM, SIGINT)
-
-**Deliverable**: Clean shutdown handling for coordinators and workers
-
----
-
-#### 2.5 Multi-Customer Support
-**Owner**: Backend Engineer
-**Duration**: 5 days
-
-**Tasks**:
-- [ ] Implement customer onboarding API (admin-only)
-- [ ] Create API key generation and storage (hashed in database)
-- [ ] Update API authentication middleware to extract customer_id
-- [ ] Add customer_id filtering to all database queries
-- [ ] Implement customer tier enforcement (rate limits, concurrency limits)
-- [ ] Add per-customer metrics
-- [ ] Write tests for multi-tenant isolation
-
-**Deliverable**: Multi-customer support with API key authentication
-
----
-
-#### 2.6 Rate Limiting
-**Owner**: Backend Engineer
-**Duration**: 3 days
-
-**Tasks**:
-- [ ] Implement rate limiter (token bucket algorithm)
-- [ ] Apply rate limits per customer based on tier
-- [ ] Add rate limit headers to API responses
-- [ ] Return 429 status with retry-after on limit exceeded
-- [ ] Add rate limit metrics (throttled requests)
-- [ ] Write unit tests for rate limiting
-
-**Deliverable**: Per-customer rate limiting
-
----
-
-#### 2.7 Audit Event Logging
-**Owner**: Backend Engineer
-**Duration**: 3 days
-
-**Tasks**:
-- [ ] Implement audit event writer (insert into `audit_events` table)
-- [ ] Log events for all workload state transitions
-- [ ] Include actor information (user, coordinator, worker)
-- [ ] Add async event queue to avoid blocking API requests
-- [ ] Implement audit event query API endpoint
-- [ ] Add audit event retention cleanup job
-
-**Deliverable**: Comprehensive audit trail for all operations
-
----
-
-#### 2.8 Kubernetes Deployment
-**Owner**: DevOps Engineer
-**Duration**: 7 days
-
-**Tasks**:
-- [ ] Create Kubernetes manifests:
-  - [ ] Coordinator Deployment (3 replicas)
-  - [ ] Worker Deployment (with HPA)
-  - [ ] NATS StatefulSet
-  - [ ] PostgreSQL StatefulSet (or use managed service)
-  - [ ] ConfigMaps and Secrets
-  - [ ] Services (LoadBalancer for coordinator API)
-  - [ ] Ingress (with TLS)
-- [ ] Configure resource requests and limits
-- [ ] Set up liveness and readiness probes
-- [ ] Configure persistent volumes for stateful components
-- [ ] Test deployment and scaling
-
-**Deliverable**: Production Kubernetes deployment manifests
-
----
-
-#### 2.9 Load Testing & Performance Benchmarking
-**Owner**: Backend Engineer + QA
-**Duration**: 5 days
-
-**Tasks**:
-- [ ] Set up load testing tool (k6 or Locust)
-- [ ] Create load test scenarios:
-  - [ ] Workload submission rate (100/sec sustained)
-  - [ ] Concurrent workload execution (100 concurrent)
-  - [ ] Worker failure during load
-- [ ] Run load tests and collect metrics
-- [ ] Identify performance bottlenecks
-- [ ] Optimize queries, indexes, connection pools
-- [ ] Document performance benchmarks
-
-**Deliverable**: Performance test suite and benchmark results
-
----
-
-#### 2.10 Priority Scheduler with SLA Tiers and Aging
-**Owner**: Backend Engineer
-**Duration**: 7 days
-
-**Tasks**:
-- [ ] **[CRITICAL]** Implement priority queue with heap data structure:
-  - [ ] PriorityQueueItem with effective priority calculation
-  - [ ] Push/Pop operations
-  - [ ] Priority aging mechanism
-- [ ] Implement PriorityScheduler (extends FIFOScheduler):
-  - [ ] Calculate effective priority = base_priority × tier_weight
-  - [ ] Tier weights: Free=1, Standard=10, Premium=50, Enterprise=100
-  - [ ] Fetch customer tiers for workload batches
-  - [ ] Apply aging every N minutes to prevent starvation
-  - [ ] Aging formula: effective_priority += (age_in_minutes × boost_per_minute)
-- [ ] Add configuration options:
-  - [ ] EnablePriority flag
-  - [ ] EnableAging flag
-  - [ ] AgingIntervalMinutes (default: 10)
-  - [ ] AgingBoostPerMinute (default: 5)
-- [ ] Add priority metrics (wait time by tier, starvation prevention events)
-- [ ] Write unit tests for:
-  - [ ] Priority calculation with different tiers
-  - [ ] Aging mechanism
-  - [ ] Queue ordering
-
-**Deliverable**: Priority-based scheduling with SLA enforcement and starvation prevention
-
-**See Also**: [impl/06_SCHEDULER.md](impl/06_SCHEDULER.md#priority-scheduler-with-sla-tiers-phase-2)
-
----
-
-#### 2.11 Auto-Scaling Integration
-**Owner**: Backend Engineer + DevOps
-**Duration**: 7 days
-
-**Tasks**:
-- [ ] **[CRITICAL]** Implement custom metrics exporter:
-  - [ ] Queue depth metric publishing (every 30s)
-  - [ ] Worker utilization percentage calculation
-  - [ ] Prometheus gauge registration
-  - [ ] Error handling and recovery
-- [ ] **Kubernetes HPA Setup**:
-  - [ ] Create HPA manifest with custom metrics
-  - [ ] Configure scale triggers: queue_depth > 100 per worker
-  - [ ] Configure scale triggers: worker_utilization > 70%
-  - [ ] Set min replicas: 3, max replicas: 500
-  - [ ] Configure scale-up/down policies:
-    - [ ] Scale up: +50% every 60s (stabilization window)
-    - [ ] Scale down: -10% every 60s (stabilization window: 300s)
-- [ ] **EC2 Auto Scaling (optional)**:
-  - [ ] Publish CloudWatch custom metrics
-  - [ ] Configure ASG with target tracking
-  - [ ] Scale based on custom:QueueDepth metric
-- [ ] Test auto-scaling:
-  - [ ] Trigger scale-up with load
-  - [ ] Verify scale-down after load drops
-  - [ ] Measure scale-up time (target: < 5 minutes)
-- [ ] Add monitoring dashboards for scaling events
-
-**Deliverable**: Automatic horizontal scaling based on queue depth and utilization
-
-**See Also**: [impl/GAP_ANALYSIS.md](impl/GAP_ANALYSIS.md#missing-kubernetes-hpa-custom-metrics)
-
----
-
-#### 2.12 Database Read Replica Support (Optional for Scale)
-**Owner**: Backend Engineer + DBA
-**Duration**: 5 days
-
-**Tasks**:
-- [ ] Add read replica URL configuration
-- [ ] Implement read/write connection splitting:
-  - [ ] Write operations → primary
-  - [ ] Read operations (queries, list) → replicas
-  - [ ] GetPendingWorkloads → replica
-  - [ ] ListWorkloads → replica
-  - [ ] GetWorkload → replica (eventually consistent OK)
-- [ ] Add connection pool for replicas
-- [ ] Add replica lag monitoring
-- [ ] Test failover scenarios
-- [ ] Document when to enable (> 5K concurrent workloads)
-
-**Deliverable**: Read replica support for query offloading at scale
-
----
-
-#### 2.13 Operational Documentation
-**Owner**: Tech Lead + DevOps
-**Duration**: 5 days
-
-**Tasks**:
-- [ ] Write runbooks:
-  - [ ] Coordinator failure response
-  - [ ] Database connection issues
-  - [ ] Worker scaling procedures
-  - [ ] Emergency rollback
-  - [ ] **[NEW]** Priority queue tuning guide
-  - [ ] **[NEW]** Auto-scaling troubleshooting
-- [ ] Create operational dashboards:
-  - [ ] **[NEW]** Queue depth over time
-  - [ ] **[NEW]** Priority distribution
-  - [ ] **[NEW]** Auto-scaling events
-- [ ] Document common troubleshooting steps
-- [ ] Write on-call guide
-- [ ] Create incident response playbook
-
-**Deliverable**: Runbooks and operational guides including scale operations
-
----
-
-## Phase 3: Advanced Features
-
-### Work Items
-
-#### 3.1 Advanced Affinity Tuning and Optimization
-**Owner**: Backend Engineer
-**Duration**: 4 days
-
-**Tasks**:
-- [ ] ✅ **Already implemented in Phase 1**: Basic affinity evaluation
-- [ ] Optimize soft affinity scoring algorithm:
-  - [ ] Fine-tune score weights for different tag types
-  - [ ] Add configurable scoring policies
-  - [ ] Benchmark performance with complex affinity rules
-- [ ] Implement affinity conflict resolution strategies:
-  - [ ] Fallback options when hard affinity cannot be satisfied
-  - [ ] Alerting when affinity rules cause scheduling delays
-- [ ] Add advanced affinity metrics:
-  - [ ] Affinity match rate by rule type
-  - [ ] Average scheduling time with affinity
-  - [ ] Affinity rule violation tracking
-- [ ] Write performance tests for affinity evaluation
-
-**Deliverable**: Optimized and production-ready affinity scheduling
-
-**Note**: Core affinity features (hard, soft, anti-affinity) were implemented in Phase 1.4 and are already available.
-
----
-
-#### 3.2 Automatic Checkpointing
-**Owner**: Backend Engineer
-**Duration**: 5 days
-
-**Tasks**:
-- [ ] Implement time-based checkpoint trigger (configurable interval)
-- [ ] Implement progress-based checkpoint trigger (every 10%)
-- [ ] Add checkpoint coordinator goroutine in worker
-- [ ] Handle checkpoint failures gracefully
-- [ ] Add checkpoint interval configuration per workload type
-- [ ] Add checkpoint metrics (frequency, success rate)
-
-**Deliverable**: Automatic periodic checkpointing
-
----
-
-#### 3.4 Worker Auto-Scaling Integration
-**Owner**: Backend Engineer + DevOps
-**Duration**: 7 days
-
-**Tasks**:
-- [ ] Implement custom metrics exporter for Kubernetes HPA:
-  - [ ] Queue depth metric
-  - [ ] Average worker utilization
-- [ ] Configure HPA rules (scale up at 70% utilization)
-- [ ] For EC2: Implement CloudWatch metrics and ASG scaling policies
-- [ ] Add scaling cooldown periods
-- [ ] Test scaling behavior (scale up and down)
-- [ ] Document scaling configuration
-
-**Deliverable**: Automatic worker scaling based on load
-
----
-
-#### 3.5 Pause/Resume API
-**Owner**: Backend Engineer
-**Duration**: 4 days
-
-**Tasks**:
-- [ ] Implement `POST /v1/workloads/{id}/pause` endpoint
-- [ ] Send pause command to worker via NATS
-- [ ] Worker creates checkpoint and stops execution
-- [ ] Update workload status to PAUSED
-- [ ] Implement `POST /v1/workloads/{id}/resume` endpoint
-- [ ] Re-queue paused workload for scheduling
-- [ ] Write tests for pause/resume flow
-
-**Deliverable**: API for pausing and resuming workloads
-
----
-
-#### 3.6 WebSocket API for Real-Time Updates
-**Owner**: Backend Engineer
-**Duration**: 5 days
-
-**Tasks**:
-- [ ] Implement WebSocket server endpoint
-- [ ] Authenticate WebSocket connections
-- [ ] Subscribe to workload status changes
-- [ ] Push updates to connected clients
-- [ ] Handle client disconnections
-- [ ] Add WebSocket metrics (connections, message rate)
-- [ ] Write tests for WebSocket API
-
-**Deliverable**: Real-time workload status updates via WebSocket
-
----
-
-#### 3.7 Multi-Region Preparation
-**Owner**: Backend Engineer + Architect
-**Duration**: 5 days
-
-**Tasks**:
-- [ ] Add `region` field to workers table
-- [ ] Extend API to accept region preference
-- [ ] Update scheduler to consider region in placement
-- [ ] Design cross-region checkpoint storage (S3 replication)
-- [ ] Document multi-region architecture
-- [ ] Create deployment plan for multi-region (Phase 4)
-
-**Deliverable**: Data model and API support for multi-region
-
----
-
-#### 3.8 SDKs Development
-**Owner**: Backend Engineer
-**Duration**: 10 days (parallel)
-
-**Tasks**:
-- [ ] **Go SDK**:
-  - [ ] Implement client library
-  - [ ] Support all API endpoints
-  - [ ] Add helper methods (WaitForCompletion, StreamStatus)
-  - [ ] Write SDK documentation
-  - [ ] Publish to GitHub
-- [ ] **Python SDK**:
-  - [ ] Implement client library (using requests)
-  - [ ] Support all API endpoints
-  - [ ] Add async support (using aiohttp)
-  - [ ] Write SDK documentation
-  - [ ] Publish to PyPI
-
-**Deliverable**: Official Go and Python SDKs
-
----
-
-#### 3.9 Interactive API Documentation
-**Owner**: Backend Engineer
-**Duration**: 3 days
-
-**Tasks**:
-- [ ] Generate OpenAPI 3.0 spec from code (using annotations)
-- [ ] Host Swagger UI at `/docs` endpoint
-- [ ] Add example requests and responses
-- [ ] Document authentication flow
-- [ ] Write API usage guide
-
-**Deliverable**: Interactive API documentation
-
----
-
-## Phase 4: Scale & Optimization
-
-### Work Items
-
-#### 4.1 Database Query Optimization
-**Owner**: Backend Engineer + DBA
-**Duration**: 7 days
-
-**Tasks**:
-- [ ] Analyze slow queries using PostgreSQL logs
-- [ ] Add missing indexes
-- [ ] Optimize N+1 queries (use joins or batch queries)
-- [ ] Implement query result caching (Redis)
-- [ ] Add database connection pooling tuning
-- [ ] Use read replicas for query offloading
-- [ ] Benchmark query performance improvements
-
-**Deliverable**: Optimized database performance
-
----
-
-#### 4.2 Checkpoint Compression & S3 Offloading
-**Owner**: Backend Engineer
-**Duration**: 5 days
-
-**Tasks**:
-- [ ] Implement checkpoint compression (gzip or zstd)
-- [ ] Add size threshold for S3 offloading (> 10MB)
-- [ ] Store S3 URL in database instead of full data
-- [ ] Implement S3 upload/download in checkpoint manager
-- [ ] Add checkpoint storage metrics (size, location)
-- [ ] Test large checkpoint handling
-
-**Deliverable**: Efficient storage for large checkpoints
-
----
-
-#### 4.3 Batch Operations API
-**Owner**: Backend Engineer
-**Duration**: 5 days
-
-**Tasks**:
-- [ ] Implement `POST /v1/workloads/batch` for bulk submission
-- [ ] Accept array of workload submissions
-- [ ] Process submissions in transaction
-- [ ] Return array of workload IDs
-- [ ] Implement `POST /v1/workloads/batch/cancel` for bulk cancel
-- [ ] Add batch operation metrics
-
-**Deliverable**: Batch API for high-throughput clients
-
----
-
-#### 4.4 Multi-Region Deployment
-**Owner**: DevOps + Backend Engineer
-**Duration**: 10 days
-
-**Tasks**:
-- [ ] Deploy infrastructure in second region
-- [ ] Configure cross-region database replication
-- [ ] Set up global load balancer (Route53, CloudFront)
-- [ ] Implement region-aware routing in API
-- [ ] Test cross-region failover
-- [ ] Document multi-region operations
-
-**Deliverable**: Active-active multi-region deployment
-
----
-
-#### 4.5 Cost Optimization
-**Owner**: DevOps
-**Duration**: 5 days
-
-**Tasks**:
-- [ ] Analyze resource utilization (CPU, memory, disk)
-- [ ] Right-size worker instances
-- [ ] Use spot instances for non-critical workers
-- [ ] Implement idle worker shutdown
-- [ ] Optimize database instance sizing
-- [ ] Set up cost monitoring and alerts
-- [ ] Document cost savings
-
-**Deliverable**: 30% cost reduction from Phase 2
-
----
-
-#### 4.6 Advanced Analytics & Reporting
-**Owner**: Backend Engineer
-**Duration**: 7 days
-
-**Tasks**:
-- [ ] Implement analytics API endpoints:
-  - [ ] Workload execution trends
-  - [ ] Customer usage reports
-  - [ ] Worker utilization reports
-  - [ ] Cost per workload
-- [ ] Create materialized views for common aggregations
-- [ ] Add data export functionality (CSV, JSON)
-- [ ] Build internal admin dashboard
-- [ ] Schedule periodic reports
-
-**Deliverable**: Analytics and reporting capabilities
-
----
-
-#### 4.7 Chaos Engineering & Fault Injection
-**Owner**: QA + Backend Engineer
-**Duration**: 7 days
-
-**Tasks**:
-- [ ] Set up Chaos Monkey or Gremlin
-- [ ] Create failure scenarios:
-  - [ ] Random pod kills
-  - [ ] Network latency injection
-  - [ ] Database connection failures
-- [ ] Run chaos experiments in staging
-- [ ] Measure system resilience (recovery time, data loss)
-- [ ] Fix identified weaknesses
-- [ ] Document chaos testing procedures
-
-**Deliverable**: Validated system resilience through chaos engineering
-
----
 
 ## Resource Requirements
 
@@ -1197,83 +367,89 @@ This document outlines a phased approach to implementing Niyanta, a distributed 
 
 ## Success Metrics
 
-### Phase 1 (MVP)
-- ✅ End-to-end workload execution succeeds 95% of time in dev
-- ✅ Worker failure recovery works within 2 minutes
-- ✅ API response time < 500ms p95
-- ✅ Zero critical bugs in staging
+Each phase has its own success criteria embedded in the §[Development Phases](#development-phases) narrative. The summary below captures the cross-phase quality bars.
 
-### Phase 2 (Production)
-- ✅ System uptime: 99.5%
-- ✅ API response time: < 200ms p95
-- ✅ Worker failure detection: < 60 seconds
-- ✅ Coordinator failover: < 30 seconds
-- ✅ Support 100 concurrent workloads
-- ✅ Zero data loss during failures
-- ✅ First production customer onboarded
+### After Phase 1
+- End-to-end activity execution succeeds ≥95% of the time in dev.
+- Activity survives a process restart; in-flight attempts marked INTERRUPTED, fresh attempts enqueued, completion observed.
+- Framework-managed retries respect declared `RetryPolicy`; non-retryable errors fail fast.
 
-### Phase 3 (Advanced Features)
-- ✅ Affinity rules applied correctly 95% of time
-- ✅ Auto-scaling responds within 5 minutes
-- ✅ SDK adoption by 3+ customers
-- ✅ Support 500 concurrent workloads
+### After Phase 2
+- Worker failure detection < 60s.
+- Redistribution within 2 minutes of detection.
+- Hard, soft, and anti-affinity rules placed correctly in test scenarios.
+- Lease/fence tokens prevent split-brain when SIGSTOP'd workers resume.
 
-### Phase 4 (Scale)
-- ✅ System uptime: 99.9%
-- ✅ API response time: < 100ms p95
-- ✅ Support 1000+ concurrent workloads
-- ✅ Cost per workload reduced by 30%
-- ✅ Multi-region deployment active
+### After Phase 3
+- Sub-activities run exactly once across parent attempts.
+- Replay short-circuit measurable: parent re-runs in microseconds per logged call.
+- Determinism violations detected at runtime with clear errors.
+
+### After Phase 4 (use-case parity)
+- Multi-day monitor activity submitted, sleeping, signaled, woken, and completing children — observed end-to-end.
+- Signal delivered while no worker holds the parent is durably persisted and delivered on resume.
+- `AwaitSignal` timeout fires correctly when no signal arrives.
+
+### After Phase 5 (production shape)
+- API p95 latency < 200ms.
+- Multi-tenant isolation: customer A cannot observe or affect customer B.
+- Premium-tier activity scheduled before free-tier when both are pending.
+- No activity in queue starves longer than 30 minutes (aging).
+- Rate limit and backpressure paths return correct status codes and `Retry-After` headers.
+
+### After Phase 6 (hardened)
+- Coordinator failover < 30s with no progress lost.
+- Sustained 1000 activities/min for 24h with no errors.
+- HPA scales workers up under load, down when idle.
+- Determinism lint catches deliberately-broken activity in CI.
+- Architecture targets from [ARCHITECTURE.md:693-702](ARCHITECTURE.md#L693-L702) met under load test.
 
 ---
 
 ## Timeline & Milestones
 
-### Gantt Chart (High-Level)
+Solo-engineer estimates per the §[Phases Overview](#phases-overview) table. Times double under part-time attention; phase boundaries are designed so stopping between phases leaves a working system.
+
+### Solo Gantt (rough)
 
 ```
-Week 1-2:   [Phase 0: Foundation]
-Week 3-10:  [Phase 1: MVP Development.....................]
-Week 11:    [Phase 1: Testing & Bug Fixes]
-Week 12:    [Phase 1: MVP Release] ✓
-Week 13-20: [Phase 2: Production Hardening................]
-Week 21:    [Phase 2: Load Testing & Staging]
-Week 22:    [Phase 2: Production Release] ✓
-Week 23-30: [Phase 3: Advanced Features...................]
-Week 31:    [Phase 3: Feature Release] ✓
-Week 32-40: [Phase 4: Scale & Optimization................]
-Week 40+:   [Ongoing: Maintenance & Iteration...........]
+Week 1:    [Phase 0: skeleton + in-memory]
+Week 2-3:  [Phase 1: Postgres + retries]
+Week 4-5:  [Phase 2: coordinator/worker + NATS + affinity]
+Week 6-8:  [Phase 3: RunChild + replay]
+Week 9-11: [Phase 4: Sleep/Now/NewID + SignalBus + AwaitSignal]   ← use-case parity
+Week 12-14:[Phase 5: API + auth + observability + priority]       ← production shape
+Week 15+:  [Phase 6: HA + auto-scaling + JetStream + chaos + scale]
 ```
 
 ### Key Milestones
 
-| Milestone | Week | Description |
-|-----------|------|-------------|
-| **M0**: Project Kickoff | Week 1 | Team formed, repo created, infrastructure provisioned |
-| **M1**: MVP Alpha | Week 8 | Core functionality working in dev environment |
-| **M2**: MVP Release | Week 12 | First working version deployed to staging |
-| **M3**: Production Beta | Week 20 | Production-ready system in staging |
-| **M4**: Production GA | Week 22 | System live in production with first customer |
-| **M5**: Feature Complete | Week 31 | All Phase 3 features released |
-| **M6**: Scale Milestone | Week 40 | System handling 1000+ concurrent workloads |
+| Milestone | Phase end | Description |
+|-----------|-----------|-------------|
+| **M0**: Skeleton | Phase 0 | All interfaces exist; in-memory demo runs |
+| **M1**: Persistent | Phase 1 | Activities survive restart; framework retries |
+| **M2**: Distributed | Phase 2 | Coordinator + workers; failure redistribution |
+| **M3**: Composable | Phase 3 | `RunChild` + replay-based resume |
+| **M4**: Use-case parity | Phase 4 | Signals + Sleep — agentic monitors and ingestion expressible |
+| **M5**: Production shape | Phase 5 | REST API, multi-tenant, observable |
+| **M6**: Hardened | Phase 6 | HA, auto-scale, scale targets met |
 
 ---
 
-## Post-Launch Roadmap
+## Post-Phase 6 Roadmap
 
-### Phase 5: Future Enhancements (Weeks 40+)
+Items not on the critical path for the stated use cases. Pick up as needed.
 
-**Potential Features**:
-- [ ] gRPC API as primary interface
-- [ ] Workload dependencies (DAG execution)
-- [ ] Scheduled/cron workloads
-- [ ] Workload versioning and A/B testing
-- [ ] Custom worker pools per customer
-- [ ] GPU workload support
-- [ ] Integration with external schedulers (Kubernetes Jobs, Airflow)
-- [ ] Self-service customer dashboard
-- [ ] Billing and usage tracking
-- [ ] Marketplace for third-party workload types
+- gRPC API alongside REST.
+- Activity dependencies as a higher-level construct (DAG sugar over `RunChild`).
+- Scheduled / cron-like activity submission.
+- Activity versioning and A/B testing.
+- Custom worker pools per customer.
+- Integration with external schedulers (Kubernetes Jobs, Airflow).
+- Self-service customer dashboard.
+- Billing and usage tracking.
+- Multi-region deployment with region-aware scheduling.
+- Marketplace for third-party activity types.
 
 ---
 
@@ -1313,18 +489,21 @@ Week 40+:   [Ongoing: Maintenance & Iteration...........]
 
 ## References
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture details
-- [DATA_MODELS.md](DATA_MODELS.md) - Database schemas and data structures
-- [API_SPEC.md](API_SPEC.md) - Complete API contracts
-- [CLAUDE.md](../CLAUDE.md) - Development guidelines for future engineers
+- [ADR-005](adr/ADR-005-activity-execution-model.md) — Activity execution model (the basis for this plan's reframing)
+- [ARCHITECTURE.md](ARCHITECTURE.md) — System architecture (note: `Workload` references throughout will be renamed to `Activity` after Phase 3 lands)
+- [DATA_MODELS.md](DATA_MODELS.md) — Schema (will be extended in Phase 1, 3, and 4 — see each phase's Key Deliverables)
+- [API_SPEC.md](API_SPEC.md) — API contracts (full surface lands in Phase 5)
+- [CLAUDE.md](../CLAUDE.md) — Project overview and Go conventions
 
 ---
 
 ## Revision History
 
-| Version | Date | Author | Changes |
-|---------|------|--------|---------|
-| 1.0 | 2025-10-27 | Tech Lead | Initial implementation plan |
+| Version | Date | Changes |
+|---------|------|---------|
+| 1.0 | 2025-10-27 | Initial implementation plan (workload-based model, multi-engineer phasing). |
+| 2.0 | 2026-04-28 | Reframed around the activity execution model from [ADR-005](adr/ADR-005-activity-execution-model.md). Replaced workload + manual checkpoint with activity + framework-managed retries + replay-based resume. Signals promoted from Phase 3 to Phase 4 (now mandatory for stated use cases). Affinity moved from Phase 1 to Phase 2 (meaningless without multi-worker). Priority moved from Phase 2 to Phase 5 (meaningless without multi-tenant). Phasing rescaled for solo execution; old multi-engineer phasing preserved in §Resource Requirements. Removed redundant per-task work-item lists — phase narratives are the source of truth. |
+| 2.1 | 2026-05-01 | Recentered product framing around self-orchestrated ingestion: connector definitions/connections, ingestion planner, supervisor semantics, adaptive health, and ingestion observability. |
 
 ---
 
