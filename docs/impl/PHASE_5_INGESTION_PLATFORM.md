@@ -1,6 +1,6 @@
 # Phase 5: Production Ingestion Platform
 
-**Goal**: Build the actual product layer: connector definitions, customer connections, ingestion planner, tenant isolation, dense shared execution, observability, API, and the first declarative HTTP poller.
+**Goal**: Build the actual product layer: connector definitions, customer connections, selected catalogs, ingestion planner, tenant isolation, dense shared execution, observability, API, and the first declarative HTTP poller.
 
 Connector definitions, connection manifests, event filters, and operator-authored policies are authored as YAML. The implementation parses YAML into typed Go structs and may persist the normalized representation in Postgres `JSONB` columns for indexing and queryability.
 
@@ -12,6 +12,7 @@ Phase 5 must implement the correctness rules in [../OPERATIONS_AND_FAILURE_SEMAN
 internal/connector/models.go
 internal/connector/registry.go
 internal/connector/runtime.go
+internal/connector/catalog.go
 internal/connector/http_poller.go
 internal/ingest/planner.go
 internal/ingest/supervisor.go
@@ -34,13 +35,24 @@ const (
 )
 
 type Definition struct {
-    ID        string
-    Version   string
-    Kind      string
-    Display   Display
-    Isolation IsolationRequirement
-    Spec      Spec
+    ID            string
+    Version       string
+    Kind          string
+    Direction     Direction
+    Display       Display
+    Isolation     IsolationRequirement
+    Packaging     Packaging
+    Compatibility Compatibility
+    Spec          Spec
 }
+
+type Direction string
+
+const (
+    DirectionSource               Direction = "source"
+    DirectionDestination          Direction = "destination"
+    DirectionSourceAndDestination Direction = "source_and_destination"
+)
 
 type IsolationRequirement struct {
     MinimumLevel             IsolationLevel
@@ -60,6 +72,45 @@ type Connection struct {
     Config            map[string]any
     SecretRefs        map[string]string
     Destination       Destination
+    Catalog           Catalog
+    CatalogVersion    string
+}
+
+type Packaging struct {
+    Mode                 string
+    Runtime              string
+    Image                string
+    Entrypoint           []string
+    AllowedHosts         []string
+    ResourceRequirements map[string]ResourceRequirement
+}
+
+type Compatibility struct {
+    Protocol        string
+    ProtocolVersion string
+    ImportedFrom    string
+}
+
+type Catalog struct {
+    Streams []CatalogStream
+}
+
+type CatalogStream struct {
+    Name                 string
+    Namespace            string
+    SourceSchemaRef      string
+    PrimaryKey           []string
+    CursorField          []string
+    SupportedSyncModes   []string
+    DefaultSyncMode      string
+    DestinationSyncModes []string
+}
+
+type ResourceRequirement struct {
+    CPURequest    string
+    CPULimit      string
+    MemoryRequest string
+    MemoryLimit   string
 }
 
 type ControlState struct {
@@ -89,9 +140,12 @@ CREATE TABLE connector_definitions (
     id              TEXT NOT NULL,
     version         TEXT NOT NULL,
     kind            TEXT NOT NULL,
+    direction       TEXT NOT NULL DEFAULT 'source',
     owner_customer_id TEXT,
     display         JSONB NOT NULL,
     isolation       JSONB NOT NULL,
+    packaging       JSONB NOT NULL DEFAULT '{}',
+    compatibility   JSONB NOT NULL DEFAULT '{}',
     spec            JSONB NOT NULL,
     status          TEXT NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -109,6 +163,8 @@ CREATE TABLE connector_connections (
     config              JSONB NOT NULL,
     secret_refs         JSONB NOT NULL,
     destination         JSONB NOT NULL,
+    catalog             JSONB NOT NULL DEFAULT '{}',
+    catalog_version     TEXT,
     health              JSONB NOT NULL DEFAULT '{}',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -572,13 +628,31 @@ func (p *Planner) planConnection(ctx context.Context, conn connector.Connection)
 ## HTTP Poller Runtime
 
 ```go
+type ConnectorExecutor interface {
+    GetSpec(ctx context.Context, definition connector.Definition) (connector.Spec, error)
+    Validate(ctx context.Context, conn connector.Connection) error
+    Test(ctx context.Context, conn connector.Connection) connector.TestResult
+    Discover(ctx context.Context, conn connector.Connection) (connector.Catalog, error)
+    Run(ctx context.Context, run connector.Run, catalog connector.Catalog, checkpoint []byte, sink RecordSink) ([]byte, error)
+}
+
 type HTTPPoller struct {
     client  *http.Client
     secrets SecretResolver
     sink    RecordSink
 }
 
-func (p *HTTPPoller) Run(ctx context.Context, run connector.Run, checkpoint []byte) ([]byte, error) {
+func (p *HTTPPoller) GetSpec(ctx context.Context, definition connector.Definition) (connector.Spec, error) {
+    return definition.Spec, nil
+}
+
+func (p *HTTPPoller) Discover(ctx context.Context, conn connector.Connection) (connector.Catalog, error) {
+    // Phase 5 supports static catalogs declared by the connector definition.
+    // Dynamic discovery and Airbyte-compatible discovery arrive in Phase 5A/5B.
+    return catalogFromDefinition(conn.DefinitionID, conn.DefinitionVersion), nil
+}
+
+func (p *HTTPPoller) Run(ctx context.Context, run connector.Run, catalog connector.Catalog, checkpoint []byte) ([]byte, error) {
     req, err := p.buildRequest(ctx, run, checkpoint)
     if err != nil {
         return nil, err
@@ -610,6 +684,8 @@ func (p *HTTPPoller) Run(ctx context.Context, run connector.Run, checkpoint []by
     return nextCheckpoint, nil
 }
 ```
+
+Phase 5 stores and uses selected catalogs, but only for the native `poll_http` runtime. Airbyte-compatible command execution, database discovery, CDC discovery, and destination connector discovery are Phase 5A/5B work.
 
 ## Dead Letter Sink
 
@@ -852,3 +928,6 @@ var (
 - The product flow is connector-first.
 - Ingestion is self-orchestrated.
 - Multi-tenant high-density execution is safe by default.
+- Connector definitions include direction, packaging, and compatibility metadata.
+- Connections can discover, store, select, and run against a versioned catalog for the native `poll_http` runtime.
+- Broader connector families are explicitly deferred: Airbyte-compatible command execution to Phase 5A/5B, and `database_source`, `cdc_source`, and complex `destination_connector` runtimes to Phase 5B.

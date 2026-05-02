@@ -1,7 +1,7 @@
 # General Purpose Data Connector Specification
 
-**Version**: 0.1
-**Last Updated**: 2026-05-01
+**Version**: 0.2
+**Last Updated**: 2026-05-03
 **Status**: Draft
 
 ## Overview
@@ -40,17 +40,29 @@ The connector system must be:
 
 The Sentinel guide separates connectors by how data moves:
 
-| Pattern | Source shape | Runtime behavior | Niyanta equivalent |
-|---------|--------------|------------------|--------------------|
+| Pattern | Source or destination shape | Runtime behavior | Niyanta equivalent |
+|---------|-----------------------------|------------------|--------------------|
 | API push | External product can send events to the platform | Expose an ingestion endpoint and validate signed requests | `push_http` connector |
 | Native SaaS polling | Platform calls a remote API on a schedule | Declarative auth, request, response, paging, and DCR/destination config | `poll_http` connector |
 | Function/worker polling | Custom code polls a source API | Run a packaged connector worker with code hooks | `worker_plugin` connector |
+| Database snapshot or query | Source exposes SQL/JDBC-like access | Discover tables, plan snapshots or cursor queries, checkpoint per stream/table | `database_source` connector |
+| Database CDC | Source exposes replication logs such as WAL/binlog/redo logs | Claim replication slots or subscriptions, read ordered changes, checkpoint LSN/SCN/binlog offsets | `cdc_source` connector |
 | Blob/object ingestion | Files are written to object storage | Scan, claim, parse, checkpoint file offsets or object versions | `object_store` connector |
-| Managed stream subscription | Source exposes Kafka-compatible topics, Event Hubs, Pub/Sub, or OCI Streaming | Claim partitions/subscriptions, consume batches, commit offsets only after delivery | `stream_subscription` connector |
+| Managed stream subscription | Source exposes Kafka-compatible topics, Event Hubs, Pub/Sub, Kinesis, Pulsar, RabbitMQ, or OCI Streaming | Claim partitions/subscriptions, consume batches, commit offsets only after delivery | `stream_subscription` connector |
 | CEF/syslog stream | Source emits standard text events | Agent or listener receives lines, parses, normalizes, forwards | `stream_listener` connector |
 | Manual/import utility | Operator uploads or replays data | Batch parse and emit records | `batch_import` connector |
+| Destination writer | Platform writes records into warehouses, lakes, queues, APIs, or vector stores | Validate destination config, create or evolve target schema when allowed, batch writes, checkpoint destination commits | `destination_connector` |
 
-Design implication: connector definitions must describe the ingestion strategy explicitly, while connector runs should share the same lifecycle, checkpoint, retry, health, and delivery machinery.
+Design implication: connector definitions must describe the data movement strategy explicitly, while connector runs should share the same lifecycle, checkpoint, retry, health, and delivery machinery. Source connectors produce records; destination connectors consume records. Niyanta's ingestion-first product may expose destinations as sink adapters, but the spec must also be able to model Airbyte-style destinations as independently versioned connectors when the destination behavior is complex.
+
+Airbyte-style connector repositories commonly contain:
+
+- a connector metadata file with connector type, subtype, Docker image, release stage, documentation, resource requirements, allowed hosts, support level, and test-suite metadata
+- a declarative manifest for low-code HTTP/API sources
+- optional custom Python, Java, or other runtime code
+- configuration schema, connection tests, discovery/catalog behavior, stream schemas, state/checkpoint migration rules, and acceptance/integration tests
+
+Niyanta definitions should be able to import or translate these fields without requiring the Airbyte runtime protocol to be the platform's native protocol.
 
 ### 2. Connector UX Metadata Is Separate From Connection Behavior
 
@@ -72,7 +84,9 @@ API pollers and blob readers both depend on persisted progress:
 - Pagination cursors: next page token, link header, offset, page number.
 - Stream offsets: file offset, partition offset, sequence number.
 - Object position: bucket, key, version, etag, byte range.
+- Database positions: table cursor, primary-key range, snapshot chunk, WAL LSN, binlog file/position, GTID set, SCN, resume token.
 - Deduplication watermarks: event IDs or source hashes.
+- Catalog versions: selected stream schemas, cursor fields, primary keys, and sync modes used by a run.
 
 In Niyanta, these are connector checkpoints. They must be small, durable, versioned structured blobs stored through the existing checkpoint model. They may be represented as YAML in examples and stored as parsed `JSONB` internally.
 
@@ -121,10 +135,26 @@ capabilities:
   - scheduled
   - multi_connection
   - checkpointed
+direction: source
 isolation:
   minimum_level: shared
   requires_dedicated_network: false
   allows_shared_workers: true
+packaging:
+  mode: declarative
+  runtime: niyanta
+  image: null
+  entrypoint: null
+  allowed_hosts:
+    - api.github.com
+  resource_requirements:
+    default:
+      cpu_request: 100m
+      memory_request: 256Mi
+compatibility:
+  protocol: niyanta
+  protocol_version: 0.1
+  imported_from: null
 configuration_schema: {}
 source_schema: {}
 output_schema: {}
@@ -144,8 +174,11 @@ Rules:
 - `version` follows semantic versioning.
 - Breaking schema or checkpoint changes require a new major version.
 - Definitions are immutable after publication except metadata-only patch versions.
+- `direction` is `source`, `destination`, or `source_and_destination`.
 - Public definitions can be shared across tenants; private definitions must carry tenant ownership.
 - Isolation requirements are part of compatibility and cannot be weakened in a patch version.
+- `packaging` describes how executable behavior is delivered, including declarative manifests, native Niyanta plugins, Docker/OCI images, Java archives, Python packages, or external command protocols.
+- `compatibility` declares whether the connector uses the native Niyanta runtime contract, an Airbyte-compatible command contract, or a custom adapter.
 
 ### ConnectorConnection
 
@@ -320,6 +353,137 @@ Required sections:
 - checkpoint: object key/version/etag plus byte offset when needed
 - archival or processed-marker policy
 
+### `database_source`
+
+Reads from operational databases through SQL, JDBC/ODBC-like drivers, or native database protocols.
+
+This covers snapshot and cursor-based extraction from:
+
+- PostgreSQL
+- MySQL and MariaDB
+- Microsoft SQL Server
+- Oracle
+- Snowflake, BigQuery, Redshift, Databricks, ClickHouse, DuckDB, and other analytical databases
+- MongoDB, Cassandra, DynamoDB, Elasticsearch, and similar database-shaped sources when represented through a custom adapter
+
+Required sections:
+
+- provider and driver identity
+- connection and network policy
+- credential and TLS/SSH tunnel references
+- schema discovery policy
+- stream/table selection policy
+- snapshot mode and chunking policy
+- incremental cursor policy when CDC is not used
+- checkpoint: per stream/table cursor, primary key boundary, page token, or completed snapshot chunk
+- type mapping and schema evolution policy
+- destination
+
+YAML example:
+
+```yaml
+kind: database_source
+provider: postgres
+driver:
+  type: native
+  package: niyanta-postgres
+connection:
+  host_ref: db_host
+  port: 5432
+  database: app
+  username_ref: db_username
+  password_ref: db_password
+  tls:
+    mode: require
+discovery:
+  include_schemas:
+    - public
+  exclude_tables:
+    - public.audit_temp
+streams:
+  - name: public.orders
+    primary_key:
+      - id
+    cursor_field: updated_at
+    sync_mode: incremental_append
+snapshot:
+  chunking:
+    mode: primary_key_range
+    target_rows: 50000
+checkpoint:
+  mode: per_stream_cursor
+destination:
+  type: stream
+  name: database_changes
+```
+
+Rules:
+
+- Discovery must be repeatable and versioned so a connection can explain why a stream was added, removed, or changed.
+- Snapshot chunk checkpoints must be independent per stream/table.
+- Incremental cursor reads must define cursor ordering, null handling, and tie-breaking with primary keys or deterministic synthetic keys.
+- Schema evolution must declare whether new columns are auto-added, ignored, quarantined, or require operator approval.
+- Network isolation defaults to `pooled` or `dedicated` when tenant-specific database access, private connectivity, SSH tunneling, or static egress IPs are required.
+
+### `cdc_source`
+
+Reads ordered database changes from replication logs.
+
+This covers:
+
+- PostgreSQL logical replication and WAL LSNs
+- MySQL/MariaDB binlogs and GTIDs
+- SQL Server CDC/Change Tracking or transaction log readers
+- Oracle redo/SCN based capture
+- MongoDB change streams
+- database-specific managed CDC APIs
+
+Required sections:
+
+- provider and replication mechanism
+- replication slot/subscription or change stream identity
+- initial snapshot policy
+- publication/table selection
+- ordering and transaction boundary policy
+- checkpoint: LSN, SCN, binlog file/position, GTID set, resume token, or provider cursor
+- schema history storage policy
+- heartbeat and lag policy
+- destination
+
+YAML example:
+
+```yaml
+kind: cdc_source
+provider: postgres
+replication:
+  mechanism: logical_replication
+  slot_name: niyanta_conn_123
+  publication: niyanta_publication
+  plugin: pgoutput
+initial_snapshot:
+  mode: consistent_snapshot_then_cdc
+checkpoint:
+  mode: lsn_after_delivery
+  value:
+    lsn: "0/16B6C50"
+schema_history:
+  storage: niyanta_state
+  migration_policy: versioned
+lag:
+  heartbeat_interval_seconds: 30
+destination:
+  type: stream
+  name: database_cdc
+```
+
+Rules:
+
+- CDC checkpoints must advance only after all records up to the checkpoint are delivered.
+- Initial snapshots and live CDC must use isolated checkpoint namespaces unless the connector proves a consistent handoff point.
+- Transaction ordering must be preserved within a source partition or replication stream.
+- DDL/schema-change handling must be explicit: apply, ignore, quarantine, or fail.
+- Replication slots, publications, and source-side resources must be cleaned up only by an explicit lifecycle policy.
+
 ### `stream_listener`
 
 Receives syslog, CEF, raw TCP/UDP, or agent-forwarded streams.
@@ -343,11 +507,14 @@ Consumes from broker-backed event streams where the source owns durable topics/s
 - Confluent-compatible Kafka
 - Azure Event Hubs Kafka endpoint or native Event Hubs consumer groups
 - Google Cloud Pub/Sub subscriptions
+- Amazon Kinesis
+- Apache Pulsar
+- RabbitMQ streams or queues
 - OCI Streaming
 
 Required sections:
 
-- provider: `kafka`, `event_hubs`, `gcp_pubsub`, `oci_streaming`
+- provider: `kafka`, `event_hubs`, `gcp_pubsub`, `kinesis`, `pulsar`, `rabbitmq`, `oci_streaming`
 - subscription identity: topic/subscription/stream name and consumer group where applicable
 - partition or shard discovery policy
 - consumer group ownership mode
@@ -403,6 +570,9 @@ Provider mapping:
 | Kafka | topic partition | consumer group | topic, partition, offset |
 | Azure Event Hubs | event hub partition | consumer group | namespace, event hub, partition, offset/sequence number |
 | GCP Pub/Sub | subscription stream | subscription | ack ID plus message ID/order key when available |
+| Amazon Kinesis | stream shard | consumer ARN/application name | stream, shard, sequence number |
+| Apache Pulsar | topic partition | subscription | topic, partition, message ID |
+| RabbitMQ | queue or stream partition | consumer tag/group where available | queue/stream, delivery tag, offset when stream-backed |
 | OCI Streaming | stream partition | group cursor | stream OCID, partition, cursor/offset |
 
 Rules:
@@ -453,6 +623,61 @@ Required sections:
 - input/output contracts
 
 This maps directly to the Niyanta activity plugin model.
+
+### `destination_connector`
+
+Writes records into external systems when a simple sink adapter is insufficient.
+
+This covers:
+
+- databases and warehouses such as Postgres, MySQL, BigQuery, Snowflake, Redshift, Databricks, ClickHouse, DuckDB, Cassandra, MongoDB, and Elasticsearch
+- object and lake storage such as S3, GCS, Azure Blob, R2, Iceberg, Delta, or data lake layouts
+- queues and streams such as Kafka, Kinesis, Pub/Sub, Pulsar, RabbitMQ, SQS, and MQTT
+- search, vector, and application destinations such as OpenSearch, Qdrant, Pinecone, Weaviate, Milvus, Chroma, Typesense, HubSpot, Customer.io, or webhook APIs
+
+Required sections:
+
+- destination provider and write protocol
+- config schema and secret refs
+- accepted input schema or stream contract
+- write mode: append, overwrite, upsert, append_dedupe, exactly_once_when_supported
+- batching, staging, and commit policy
+- schema creation/evolution policy
+- idempotency key or transactional commit behavior
+- checkpoint/commit acknowledgement shape
+- dead-letter behavior
+
+YAML example:
+
+```yaml
+kind: destination_connector
+direction: destination
+provider: s3
+format:
+  type: parquet
+  compression: zstd
+layout:
+  bucket_ref: dest_bucket
+  prefix: raw/{{connection_id}}/{{stream_name}}/
+  partitioning:
+    - field: event_date
+      transform: date
+write:
+  mode: append
+  batch_size: 100000
+  staging: niyanta_managed
+  commit: atomic_manifest
+checkpoint:
+  mode: destination_commit_receipt
+```
+
+Rules:
+
+- Destination connectors may be public, tenant-private, or connection-private.
+- A source run may checkpoint only after the destination connector returns a durable commit receipt.
+- Destination schema evolution must declare how target tables, indexes, object layouts, or vector collections are created and modified.
+- Upsert and exactly-once modes require deterministic keys, transaction support, or destination-side idempotency.
+- Destination connectors must support dry-run validation that does not mutate the target unless explicitly configured.
 
 ## Declarative Connector Spec
 
@@ -573,6 +798,103 @@ Supported destinations:
 - message broker topic
 - custom worker plugin sink
 
+## Packaging And Compatibility
+
+Connector definitions must separate source/destination semantics from executable packaging. This allows the same domain model to represent native Niyanta connectors, declarative manifests, and Airbyte-style packaged connectors.
+
+Supported packaging modes:
+
+- `declarative`: YAML manifest interpreted by the Niyanta generic runtime.
+- `native_plugin`: compiled or interpreted plugin loaded through the Niyanta activity plugin model.
+- `oci_image`: container image executed through a controlled command adapter.
+- `external_command`: executable command with a declared protocol and sandbox policy.
+- `airbyte_manifest`: Airbyte low-code/declarative source manifest translated or interpreted by an adapter.
+- `airbyte_image`: Airbyte-compatible Docker image using Airbyte's command protocol.
+
+Packaging shape:
+
+```yaml
+packaging:
+  mode: airbyte_image
+  runtime: docker
+  image: airbyte/source-hubspot:6.3.5
+  digest: sha256:example
+  entrypoint:
+    - /airbyte/integration_code/main
+  command_protocol: airbyte
+  command_protocol_version: v0
+  allowed_hosts:
+    - api.hubapi.com
+  resource_requirements:
+    check:
+      memory_request: 1600Mi
+      memory_limit: 1600Mi
+    discover:
+      memory_request: 1024Mi
+      memory_limit: 1024Mi
+    read:
+      cpu_request: 500m
+      memory_request: 1024Mi
+  release:
+    stage: generally_available
+    support_level: certified
+    license: ELv2
+    documentation_url: https://docs.airbyte.com/integrations/sources/hubspot
+```
+
+Compatibility rules:
+
+- Native Niyanta connectors should prefer `declarative` or `native_plugin`.
+- Airbyte low-code manifests may be translated to `poll_http` when they only use supported declarative features.
+- Airbyte connectors with custom components, custom error handlers, dynamic schema loaders, state migrations, or non-HTTP behavior should use `worker_plugin` or `airbyte_image` until a native translation exists.
+- OCI and external command packages must declare allowed hosts, resource requirements, secret access scope, temporary filesystem policy, and network isolation.
+- Imported connector metadata must preserve upstream version, image tag/digest, documentation URL, release stage, support level, breaking-change notes, and test-suite references.
+- Niyanta remains responsible for tenant isolation, secret resolution, scheduling, destination commit ordering, metrics, logs, and checkpoint durability even when execution is delegated to an adapter.
+
+## Airbyte-Compatible Runtime Mapping
+
+Niyanta's native runtime contract is the source of truth, but the spec can model Airbyte-style connectors through an adapter layer.
+
+Airbyte command mapping:
+
+| Airbyte command | Niyanta equivalent | Notes |
+|-----------------|--------------------|-------|
+| `spec` | `GetSpec` / connector definition import | Produces configuration schema, auth fields, and documentation metadata. |
+| `check` | `Test` | Validates credentials, network reachability, and required permissions. |
+| `discover` | `Discover` | Produces stream catalog, schemas, primary keys, cursor fields, and supported sync modes. |
+| `read` | `Run` | Emits records and state/checkpoint messages for selected streams. |
+| state messages | checkpoint manager | State is normalized into Niyanta's versioned checkpoint model. |
+| trace/log messages | ingestion events and logs | Secrets and payload samples are redacted according to Niyanta policy. |
+
+Catalog model:
+
+```yaml
+catalog:
+  streams:
+    - name: contacts
+      namespace: hubspot
+      source_schema_ref: schemas/hubspot.contacts.v1
+      primary_key:
+        - id
+      cursor_field:
+        - updatedAt
+      supported_sync_modes:
+        - full_refresh
+        - incremental
+      default_sync_mode: incremental
+      destination_sync_modes:
+        - append
+        - append_dedupe
+```
+
+Rules:
+
+- Discovery output is stored as a versioned catalog snapshot on the connection.
+- A run references a selected catalog version, not a mutable discovery result.
+- Stream-level state must be preserved when translating Airbyte state into Niyanta checkpoints.
+- Per-stream failures may degrade only the affected stream when the connector declares stream-isolated execution.
+- Airbyte `full_refresh`, `incremental`, `append`, `overwrite`, and dedupe modes must map to explicit Niyanta run and destination policies before a connection is enabled.
+
 ## Execution Semantics
 
 Operational correctness rules for delivery guarantees, checkpoint commit order, dead letters, versioning, secret rotation, backfills, and blast-radius controls are defined in [OPERATIONS_AND_FAILURE_SEMANTICS.md](OPERATIONS_AND_FAILURE_SEMANTICS.md).
@@ -643,6 +965,9 @@ Checkpoint rules:
 - For paginated APIs, checkpoint after each page when the destination supports idempotent writes.
 - Keep prior checkpoint until the new checkpoint is committed.
 - Version checkpoint schemas and provide migration hooks.
+- Multi-stream connectors must store state per stream/table/topic when streams can advance independently.
+- Database and CDC connectors must preserve source ordering guarantees in their checkpoint shape.
+- Imported Airbyte state must be normalized into Niyanta checkpoints without losing stream-level state, cursor precision, or state migration metadata.
 
 ### Delivery Guarantees
 
@@ -698,10 +1023,14 @@ Every connector definition must include:
 - config schema validation
 - secret reference validation
 - connectivity test
+- discovery/catalog behavior when the source or destination schema is not fully static
 - sample payloads
 - parser fixtures
+- selected catalog fixtures for multi-stream connectors
 - output schema assertions
 - checkpoint round-trip tests
+- checkpoint migration tests when state shape changes
+- destination dry-run or write validation when `direction` includes `destination`
 - dry-run mode that reads but does not commit checkpoint or deliver
 
 Publication checklist:
@@ -709,14 +1038,19 @@ Publication checklist:
 - No embedded credentials.
 - All secret fields use secret references.
 - Schema is locked for the connector version.
+- Direction is declared as `source`, `destination`, or `source_and_destination`.
+- Packaging mode, runtime, allowed hosts, resource requirements, and compatibility protocol are declared.
 - Sample events are scrubbed of PII.
 - Transform preserves raw source data when allowed.
 - Connector has sample queries or equivalent inspection recipes.
 - Connector declares permissions/prerequisites.
 - Connector declares source rate limits and retry policy.
+- Database connectors declare discovery, schema evolution, cursor, snapshot, and CDC policies where applicable.
+- Destination connectors declare write mode, schema evolution, idempotency, and commit receipt behavior.
 - Connector declares spec version compatibility and checkpoint migration behavior.
 - Connector declares dead-letter policy support.
 - Connector declares whether secret rotation should trigger immediate connection testing.
+- Imported Airbyte-style connectors preserve upstream metadata, image tag/digest, release stage, support level, breaking-change notes, and test-suite references.
 
 ## Storage Extensions
 
@@ -727,7 +1061,10 @@ CREATE TABLE connector_definitions (
     id                  VARCHAR(128) NOT NULL,
     version             VARCHAR(32) NOT NULL,
     kind                VARCHAR(64) NOT NULL,
+    direction           VARCHAR(32) NOT NULL DEFAULT 'source',
     display_json        JSONB NOT NULL,
+    packaging_json      JSONB NOT NULL DEFAULT '{}',
+    compatibility_json  JSONB NOT NULL DEFAULT '{}',
     spec_json           JSONB NOT NULL,
     status              VARCHAR(32) NOT NULL DEFAULT 'draft',
     created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
@@ -745,6 +1082,8 @@ CREATE TABLE connector_connections (
     config_json         JSONB NOT NULL,
     secret_refs_json    JSONB NOT NULL DEFAULT '{}',
     destination_json    JSONB NOT NULL,
+    catalog_json        JSONB NOT NULL DEFAULT '{}',
+    catalog_version     VARCHAR(64),
     health_json         JSONB NOT NULL DEFAULT '{}',
     created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
@@ -892,11 +1231,15 @@ Minimum coordinator APIs:
 - `POST /connector-definitions`
 - `GET /connector-definitions`
 - `GET /connector-definitions/{id}/versions/{version}`
+- `POST /connector-definitions:import`
 - `POST /connector-connections`
 - `GET /connector-connections`
 - `GET /connector-connections/{id}`
 - `PATCH /connector-connections/{id}`
 - `POST /connector-connections/{id}:test`
+- `POST /connector-connections/{id}:discover`
+- `GET /connector-connections/{id}/catalog`
+- `PATCH /connector-connections/{id}/catalog`
 - `POST /connector-connections/{id}:run`
 - `POST /connector-connections/{id}:pause`
 - `POST /connector-connections/{id}:resume`
@@ -918,9 +1261,11 @@ Connector workers should implement the existing activity interface and add a con
 
 ```go
 type ConnectorExecutor interface {
+    GetSpec(ctx context.Context, definition ConnectorDefinition) (ConnectorSpec, error)
     Validate(ctx context.Context, connection ConnectorConnection) error
     Test(ctx context.Context, connection ConnectorConnection) ConnectorTestResult
-    Run(ctx context.Context, run ConnectorRun, checkpoint []byte, sink RecordSink) ([]byte, error)
+    Discover(ctx context.Context, connection ConnectorConnection) (ConnectorCatalog, error)
+    Run(ctx context.Context, run ConnectorRun, catalog ConnectorCatalog, checkpoint []byte, sink RecordSink) ([]byte, error)
 }
 ```
 
@@ -928,19 +1273,25 @@ The generic runtime should provide:
 
 - secret resolution
 - HTTP client with retries, timeouts, rate limiting, and redaction
+- database clients, CDC readers, and stream clients where the connector kind is native
 - parser library
 - transform engine
+- schema discovery and catalog snapshot storage
 - checkpoint manager
 - destination sink adapters
+- destination connector commit receipts
 - metrics/logging wrappers
 
 Custom connector plugins should only implement behavior that cannot be expressed declaratively.
 
+Airbyte-compatible adapters should implement the same interface by translating `spec`, `check`, `discover`, `read`, record, state, log, and trace messages into Niyanta's native models.
+
 ## Recommended Implementation Phases
 
-### Phase 1: Declarative HTTP Poller
+### Phase 1: Connector Foundation And Declarative HTTP Poller
 
-- Connector definitions and connections.
+- Connector definitions and connections with `direction`, `packaging`, and `compatibility` metadata.
+- `GetSpec`, `Test`, `Discover`, selected-catalog storage, and catalog-versioned runs.
 - API key/basic/OAuth2 client credentials.
 - JSON response extraction.
 - Time window checkpointing.
@@ -957,14 +1308,26 @@ Custom connector plugins should only implement behavior that cannot be expressed
 - Backfill runs.
 - Connection test API.
 
-### Phase 3: Additional Connector Kinds
+### Phase 3: Packaging And Compatibility Foundation
+
+- Import API for external connector metadata.
+- Airbyte manifest/image metadata preservation.
+- Airbyte-compatible adapter skeleton for `spec`, `check`, `discover`, `read`, state, log, and trace messages.
+- OCI image packaging model, resource limits, allowed hosts, and runtime sandbox policy.
+- Selected-catalog diff, approval, and audit lifecycle.
+
+### Phase 4: Additional Connector Kinds
 
 - Push HTTP ingestion.
 - Object storage ingestion.
 - Syslog/CEF stream listener.
 - Worker plugin connectors.
+- Database snapshot and cursor-based sources.
+- CDC sources with ordered checkpointing.
+- Destination connectors for complex warehouse, lake, queue, API, and vector-store writes.
+- Production Airbyte image execution for selected connectors.
 
-### Phase 4: Marketplace/Packaging
+### Phase 5: Marketplace And Publication
 
 - Definition signing.
 - Version compatibility checks.

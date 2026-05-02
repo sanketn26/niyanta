@@ -1,7 +1,7 @@
 # Niyanta Implementation Plan
 
-**Version**: 2.1
-**Last Updated**: 2026-05-01
+**Version**: 2.2
+**Last Updated**: 2026-05-03
 **Status**: Planning Phase
 **Supersedes**: v1.0 (workload-based model). Reframed around the activity execution model defined in [ADR-005](adr/ADR-005-activity-execution-model.md).
 
@@ -14,6 +14,8 @@
    - [Phase 3: Sub-activities and replay-based resume](#phase-3-sub-activities-and-replay-based-resume)
    - [Phase 4: Deterministic primitives and signals](#phase-4-deterministic-primitives-and-signals)
    - [Phase 5: Production ingestion shape — connectors, planner, API, observability](#phase-5-production-ingestion-shape--connectors-planner-api-observability)
+   - [Phase 5A: Connector packaging and compatibility foundation](#phase-5a-connector-packaging-and-compatibility-foundation)
+   - [Phase 5B: Connector ecosystem breadth](#phase-5b-connector-ecosystem-breadth)
    - [Phase 6: HA, scale, hardening](#phase-6-ha-scale-hardening)
 3. [Resource Requirements](#resource-requirements) (multi-engineer view; preserved from v1)
 4. [Risk Management](#risk-management)
@@ -55,15 +57,20 @@ This document outlines a phased approach to implementing Niyanta as a self-orche
 | Phase 2 | 2 weeks | Coordinator + worker split, NATS broker, multi-worker, failure redistribution. Affinity. |
 | Phase 3 | 3 weeks | `RunChild` + replay-based resume. Sequential sub-activities. |
 | Phase 4 | 3 weeks | `ctx.Sleep`, `ctx.Now`, `ctx.NewID`. `SignalBus` interface + Postgres impl. `ctx.AwaitSignal`. |
-| Phase 5 | 3 weeks | Connector API, ingestion planner, customer/auth, isolation policy, dense shared execution, observability, audit, priority scheduling. |
+| Phase 5 | 3 weeks | Connector API, ingestion planner, customer/auth, isolation policy, dense shared execution, observability, audit, priority scheduling, connector discovery/catalog foundation. |
+| Phase 5A | 2 weeks | Connector packaging and compatibility foundation: import API, Airbyte manifest/image metadata preservation, command adapter skeleton, selected-catalog lifecycle. |
+| Phase 5B | 3-4 weeks | Connector breadth: `database_source`, `cdc_source`, complex `destination_connector`, stream-provider expansion, and production-grade Airbyte adapter execution. |
 | Phase 6 | open-ended | Coordinator HA, adaptive planner sharding, NATS JetStream `SignalBus`, auto-scaling, determinism lint, chaos, scale tuning. |
 
 **Stop point for prototypes**: end of Phase 4. The activity substrate can express self-orchestrated ingestion + agentic monitors at this point, but connector registry/planner APIs arrive in Phase 5.
 
-**Stop point for production**: end of Phase 5. Phase 6 is incremental hardening.
+**Stop point for production foundation**: end of Phase 5. This supports the first native connector class and the production control plane. Airbyte-scale connector breadth arrives in Phase 5A/5B.
+
+**Stop point for connector ecosystem parity**: end of Phase 5B. Phase 6 is incremental hardening.
 
 **Total time to use-case parity (solo)**: ~11 weeks (Phases 0–4).
-**Total time to production (solo)**: ~14 weeks (Phases 0–5).
+**Total time to production foundation (solo)**: ~14 weeks (Phases 0–5).
+**Total time to connector ecosystem parity (solo)**: ~19-20 weeks (Phases 0–5B).
 
 ---
 
@@ -229,12 +236,14 @@ The phases are designed so that **each one ends with a runnable system**. If you
 
 **Key Deliverables**:
 - Connector definition and connection APIs per [DATA_CONNECTOR_SPEC.md](DATA_CONNECTOR_SPEC.md): create/list/get/update/test/run/pause/resume.
-- Connector registry and connection manager tables: definitions, versions, customer connections, secret refs, destinations, health state.
+- Connector registry and connection manager tables: definitions, versions, direction, packaging metadata, compatibility metadata, customer connections, secret refs, destinations, selected catalog, health state.
+- Connector discovery/catalog foundation: `GetSpec`, `Discover`, selected-catalog storage, catalog versioning, and run references to a selected catalog version.
 - Isolation policy model: shared, pooled, and dedicated worker placement; tenant-scoped state, secret refs, destination refs, checkpoints, dedupe state, logs, metrics, and traces.
 - Customer ingestion operations: CID-scoped ingestion view, significant event filters, active connection controls, rate-limit overrides, and temporary disable controls for erring connections.
 - Operational failure semantics from [OPERATIONS_AND_FAILURE_SEMANTICS.md](OPERATIONS_AND_FAILURE_SEMANTICS.md): at-least-once delivery, checkpoint-after-confirmed-ingestion, dead-letter sinks, connector spec versioning, secret-rotation wakeups, backfill isolation, and blast-radius controls.
 - Ingestion planner loop from [INGESTION_ARCHITECTURE.md](INGESTION_ARCHITECTURE.md): schedules, lag, checkpoint state, backfills, source rate limits, destination backpressure, and health policy produce `ConnectorRun` records and activity attempts.
 - Initial declarative `poll_http` runtime: API key/basic/OAuth2 client credentials, JSON response extraction, time-window checkpoints, batching, and at-least-once delivery.
+- Native `poll_http` implements `GetSpec`, `Test`, `Discover`, and `Run`; Airbyte-compatible command execution is represented in the model but not executed in Phase 5.
 - Connection supervisor semantics using `ctx.Sleep` and `ctx.AwaitSignal`: config changes, backfills, and manual run requests wake the supervisor.
 - Full REST API per [API_SPEC.md](API_SPEC.md), with `workloads` renamed to `activities` throughout. Activity submit/get/list/cancel/pause/resume; logs; audit trail; customer info; usage stats; health/ready/metrics endpoints.
 - API key authentication per [API_SPEC.md:33-50](API_SPEC.md#L33-L50). Hashed in DB. Customer extraction middleware. All queries filter by `customer_id`.
@@ -248,6 +257,7 @@ The phases are designed so that **each one ends with a runnable system**. If you
 
 **Success Criteria**:
 - Create a `poll_http` connector definition and customer connection. The planner creates runs without manual workload submission.
+- Discover a catalog for the connection, store the selected catalog version, and run ingestion against that selected catalog.
 - A connection supervisor sleeps, wakes for its next poll, processes data, commits checkpoint, and schedules the next run.
 - Manual backfill uses an isolated checkpoint namespace and does not corrupt live ingestion.
 - Checkpoints are committed only after confirmed destination delivery.
@@ -266,7 +276,53 @@ The phases are designed so that **each one ends with a runnable system**. If you
 - Rate-limit and backpressure paths exercised — correct status codes, headers, `Retry-After`.
 - Grafana dashboard shows per-customer and per-connection throughput/lag/drop rate; Jaeger trace spans full lifecycle including planner, source read, destination flush, checkpoint commit, and `RunChild`.
 
-**Explicitly out of scope**: Coordinator HA; NATS JetStream `SignalBus`; auto-scaling integration (the metrics that enable it ship here, the integration ships in Phase 6).
+**Explicitly out of scope**: production Airbyte image execution; database snapshot connectors; CDC connectors; complex destination connectors; Coordinator HA; NATS JetStream `SignalBus`; auto-scaling integration (the metrics that enable it ship here, the integration ships in Phase 6).
+
+---
+
+### Phase 5A: Connector packaging and compatibility foundation
+
+**Goal**: Make the connector registry able to represent imported connector ecosystems, especially Airbyte-style manifests and images, without yet committing to every runtime behavior.
+
+**Duration**: 2 weeks (solo)
+
+**Key Deliverables**:
+- `POST /connector-definitions:import` accepts an imported connector bundle or metadata document and stores upstream identity, image tag/digest, release stage, support level, docs URL, allowed hosts, resource requirements, breaking-change notes, and test-suite references.
+- Compatibility model for `declarative`, `native_plugin`, `oci_image`, `external_command`, `airbyte_manifest`, and `airbyte_image` packaging modes.
+- Airbyte-compatible adapter skeleton maps `spec`, `check`, `discover`, `read`, state, log, and trace messages to Niyanta interfaces, with `spec/check/discover` implemented for fixture-backed test connectors.
+- Selected-catalog lifecycle: discover, diff, approve/update selected catalog, audit catalog changes, and reject runs against stale or missing catalog versions.
+- Runtime sandbox policy design for OCI/external command connectors: allowed hosts, resource limits, temp filesystem, secret scope, network isolation, and redaction.
+
+**Success Criteria**:
+- Import an Airbyte-style low-code HTTP connector metadata/manifest fixture and preserve upstream metadata in `connector_definitions`.
+- Run `spec`, `check`, and `discover` through the adapter skeleton for a fixture connector and store the selected catalog.
+- Catalog changes are audited and do not silently alter existing runs.
+- Unsupported Airbyte custom components are detected and routed to `airbyte_image` or `worker_plugin` instead of being mistranslated.
+
+**Explicitly out of scope**: production container execution; broad Airbyte catalog import; database/CDC implementation; destination connector implementation.
+
+---
+
+### Phase 5B: Connector ecosystem breadth
+
+**Goal**: Add the high-value connector families needed to handle the Airbyte connector set beyond basic HTTP polling.
+
+**Duration**: 3-4 weeks (solo)
+
+**Key Deliverables**:
+- `database_source` runtime for at least one native database, starting with PostgreSQL snapshot and cursor-based incremental reads.
+- `cdc_source` runtime spike for PostgreSQL logical replication with LSN checkpointing, schema history, and snapshot-to-CDC handoff policy.
+- `destination_connector` runtime for one complex destination, starting with S3/object-lake writes using durable commit receipts.
+- Stream subscription expansion beyond Kafka/Event Hubs/Pub/Sub/OCI to include Kinesis, Pulsar, or RabbitMQ based on customer demand.
+- Production Airbyte adapter execution for selected `airbyte_image` connectors with sandboxing, resource limits, allowed-host enforcement, state translation, and log/trace redaction.
+
+**Success Criteria**:
+- PostgreSQL database source discovers tables, stores a selected catalog, runs a chunked snapshot, and resumes from a per-table checkpoint.
+- PostgreSQL CDC source advances LSN checkpoints only after delivery and preserves transaction ordering within the replication stream.
+- S3/object-lake destination returns durable commit receipts and source checkpoints advance only after those receipts.
+- One Airbyte image connector can run through `spec/check/discover/read` in the sandbox with state normalized into Niyanta checkpoints.
+
+**Explicitly out of scope**: full Airbyte catalog parity, all database vendors, exactly-once across arbitrary destinations, marketplace signing at scale.
 
 ---
 
@@ -396,6 +452,18 @@ Each phase has its own success criteria embedded in the §[Development Phases](#
 - Premium-tier activity scheduled before free-tier when both are pending.
 - No activity in queue starves longer than 30 minutes (aging).
 - Rate limit and backpressure paths return correct status codes and `Retry-After` headers.
+- Connector definitions include direction, packaging, and compatibility metadata.
+- Connections can discover, store, select, and run against a versioned catalog.
+
+### After Phase 5A (compatibility foundation)
+- Airbyte-style metadata and manifest fixtures import without losing upstream version, image, support, docs, allowed-host, resource, and breaking-change data.
+- Adapter skeleton maps `spec/check/discover/read` concepts to Niyanta interfaces.
+- Unsupported imported connector features are rejected or routed to plugin/image execution explicitly.
+
+### After Phase 5B (connector ecosystem breadth)
+- Native database source, CDC source, and complex destination connector have end-to-end checkpoint-after-delivery tests.
+- One sandboxed Airbyte image connector runs through the adapter with state normalized into Niyanta checkpoints.
+- Destination commit receipts gate source checkpoint advancement.
 
 ### After Phase 6 (hardened)
 - Coordinator failover < 30s with no progress lost.
@@ -419,7 +487,9 @@ Week 4-5:  [Phase 2: coordinator/worker + NATS + affinity]
 Week 6-8:  [Phase 3: RunChild + replay]
 Week 9-11: [Phase 4: Sleep/Now/NewID + SignalBus + AwaitSignal]   ← use-case parity
 Week 12-14:[Phase 5: API + auth + observability + priority]       ← production shape
-Week 15+:  [Phase 6: HA + auto-scaling + JetStream + chaos + scale]
+Week 15-16:[Phase 5A: packaging + compatibility + catalog import]
+Week 17-20:[Phase 5B: DB/CDC + destination connectors + Airbyte execution]
+Week 21+:  [Phase 6: HA + auto-scaling + JetStream + chaos + scale]
 ```
 
 ### Key Milestones
@@ -431,7 +501,9 @@ Week 15+:  [Phase 6: HA + auto-scaling + JetStream + chaos + scale]
 | **M2**: Distributed | Phase 2 | Coordinator + workers; failure redistribution |
 | **M3**: Composable | Phase 3 | `RunChild` + replay-based resume |
 | **M4**: Use-case parity | Phase 4 | Signals + Sleep — agentic monitors and ingestion expressible |
-| **M5**: Production shape | Phase 5 | REST API, multi-tenant, observable |
+| **M5**: Production foundation | Phase 5 | REST API, multi-tenant, observable, catalog-aware connector platform |
+| **M5A**: Compatibility foundation | Phase 5A | Imported connector metadata and Airbyte command mapping represented |
+| **M5B**: Connector ecosystem breadth | Phase 5B | DB/CDC, destination connectors, and Airbyte image execution MVP |
 | **M6**: Hardened | Phase 6 | HA, auto-scale, scale targets met |
 
 ---
@@ -504,6 +576,7 @@ Items not on the critical path for the stated use cases. Pick up as needed.
 | 1.0 | 2025-10-27 | Initial implementation plan (workload-based model, multi-engineer phasing). |
 | 2.0 | 2026-04-28 | Reframed around the activity execution model from [ADR-005](adr/ADR-005-activity-execution-model.md). Replaced workload + manual checkpoint with activity + framework-managed retries + replay-based resume. Signals promoted from Phase 3 to Phase 4 (now mandatory for stated use cases). Affinity moved from Phase 1 to Phase 2 (meaningless without multi-worker). Priority moved from Phase 2 to Phase 5 (meaningless without multi-tenant). Phasing rescaled for solo execution; old multi-engineer phasing preserved in §Resource Requirements. Removed redundant per-task work-item lists — phase narratives are the source of truth. |
 | 2.1 | 2026-05-01 | Recentered product framing around self-orchestrated ingestion: connector definitions/connections, ingestion planner, supervisor semantics, adaptive health, and ingestion observability. |
+| 2.2 | 2026-05-03 | Split connector ecosystem breadth out of Phase 5. Phase 5 now includes catalog/discovery foundations; Phase 5A covers packaging and Airbyte-compatible import metadata; Phase 5B covers database, CDC, destination connectors, and Airbyte image execution MVP. |
 
 ---
 
