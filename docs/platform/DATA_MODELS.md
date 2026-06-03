@@ -1,8 +1,12 @@
-# Niyanta Data Models
+# Niyanta Platform Data Models
 
-**Version**: 1.0
-**Last Updated**: 2025-10-27
+**Version**: 2.0
+**Last Updated**: 2026-06-03
 **Status**: Design Phase
+
+> **v2.0 supersedes the v1 workload model.** Niyanta is a composable activity runner; its canonical persisted state is the **activity** and its execution record (attempts, call log, signals), per [adr/ADR-005-activity-execution-model.md](adr/ADR-005-activity-execution-model.md). The earlier `workloads` / `workload_configs` / `retry_count` schema is replaced. A migration map from the old vocabulary is in the appendix.
+
+This document defines the **platform** schema only — the engine's state for running activities and resuming them after failure. It is application-agnostic: it knows about activities, attempts, the call log, signals, checkpoints, workers, tenants, and audit. It does **not** know about connectors, runbooks, or any app's domain. Apps add their own tables (see [../apps/dataconnector/DATA_CONNECTOR_SPEC.md](../apps/dataconnector/DATA_CONNECTOR_SPEC.md) §Storage Extensions and [../apps/llmops/LLMOPS_SPEC.md](../apps/llmops/LLMOPS_SPEC.md) §Storage Extensions).
 
 ## Table of Contents
 1. [Overview](#overview)
@@ -13,17 +17,23 @@
 6. [Data Validation Rules](#data-validation-rules)
 7. [Indexing Strategy](#indexing-strategy)
 8. [Data Retention Policies](#data-retention-policies)
+9. [Schema Migration Strategy](#schema-migration-strategy)
+10. [Appendix: v1 → v2 Migration Map](#appendix-v1--v2-migration-map)
 
 ---
 
 ## Overview
 
-Niyanta uses PostgreSQL as the primary state storage. This document defines:
-- Database table schemas
-- Data types and constraints
-- Message formats for broker communication
-- Go struct representations
-- Validation rules and invariants
+Niyanta uses PostgreSQL as the primary state storage. The model is built around four core platform tables:
+
+- **`activities`** — the logical unit of work and its current lifecycle state.
+- **`activity_attempts`** — one row per physical execution attempt (replaces the `retry_count` integer); the audit trail of retries.
+- **`activity_calls`** — the durable **call log** of `RunChild` / `Sleep` / `AwaitSignal` invocations, used for replay-based resume.
+- **`signals`** — the durable per-activity mailbox for external events.
+
+Supporting tables: `customers` (tenants), `workers`, `checkpoints` (intra-attempt heartbeat state), `audit_events`, `coordinator_state`, `idempotency_keys`.
+
+This document defines table schemas, broker message formats, Go structs, validation rules, and invariants.
 
 ---
 
@@ -33,55 +43,48 @@ Niyanta uses PostgreSQL as the primary state storage. This document defines:
 
 ```
 ┌─────────────────┐
-│    customers    │
+│    customers    │  (tenant scope on every activity)
 │─────────────────│
 │ id (PK)         │
-│ name            │
 │ tier            │
-│ created_at      │
 └────────┬────────┘
-         │
          │ 1:N
-         │
-┌────────┴────────────┐         ┌──────────────────┐
-│    workload_configs │         │   workers        │
-│─────────────────────│         │──────────────────│
-│ id (PK)             │         │ id (PK)          │
-│ customer_id (FK)    │         │ status           │
-│ workload_type       │         │ last_heartbeat   │
-│ config_json         │         │ capacity_total   │
-│ created_at          │         │ capacity_used    │
-└────────┬────────────┘         │ capabilities     │
-         │                      └────────┬─────────┘
-         │ 1:N                           │
-         │                               │ 1:N
-┌────────┴─────────────┐                │
-│     workloads        │<───────────────┘
-│──────────────────────│
-│ id (PK)              │
-│ customer_id (FK)     │
-│ workload_config_id   │
-│ worker_id (FK, null) │
-│ status               │
-│ priority             │
-│ affinity_rules       │
-│ created_at           │
-│ scheduled_at         │
-│ started_at           │
-│ completed_at         │
-└──────────┬───────────┘
-           │
-           │ 1:N
-           │
-┌──────────┴───────────┐       ┌──────────────────┐
-│   checkpoints        │       │   audit_events   │
-│──────────────────────│       │──────────────────│
-│ id (PK)              │       │ id (PK)          │
-│ workload_id (FK)     │       │ workload_id (FK) │
-│ sequence_number      │       │ event_type       │
-│ checkpoint_data      │       │ timestamp        │
-│ created_at           │       │ details_json     │
-└──────────────────────┘       └──────────────────┘
+         ▼
+┌──────────────────────┐        ┌──────────────────┐
+│     activities       │        │   workers        │
+│──────────────────────│        │──────────────────│
+│ id (PK)              │        │ id (PK)          │
+│ customer_id (FK)     │        │ status           │
+│ activity_type        │        │ capabilities     │
+│ parent_activity_id   │◄─┐     │ capacity_*       │
+│ status               │  │self │ last_heartbeat   │
+│ priority             │  │1:N  └──────────────────┘
+│ generation           │  │ (parent → child via RunChild)
+└───┬───────┬──────┬───┘──┘
+    │1:N    │1:N   │1:N
+    ▼       ▼      ▼
+┌─────────┐ ┌──────────────┐ ┌──────────────┐
+│activity_│ │activity_calls│ │  signals     │
+│attempts │ │ (call log)   │ │ (mailbox)    │
+│─────────│ │──────────────│ │──────────────│
+│id (PK)  │ │id (PK)       │ │id (PK)       │
+│activity │ │activity_id   │ │activity_id   │
+│ _id     │ │call_index    │ │name          │
+│attempt# │ │call_type     │ │payload       │
+│worker_id│ │child_act_id  │ │delivered     │
+│error    │ │result_json   │ │created_at    │
+└────┬────┘ └──────────────┘ └──────────────┘
+     │1:N
+     ▼
+┌──────────────┐      ┌──────────────────┐
+│  checkpoints │      │   audit_events   │
+│ (heartbeat)  │      │──────────────────│
+│──────────────│      │ id (PK)          │
+│ id (PK)      │      │ activity_id (FK) │
+│ attempt_id   │      │ event_type       │
+│ seq_number   │      │ actor_type       │
+│ data         │      │ details_json     │
+└──────────────┘      └──────────────────┘
 ```
 
 ---
@@ -90,14 +93,14 @@ Niyanta uses PostgreSQL as the primary state storage. This document defines:
 
 ### 1. Customers Table
 
-**Purpose**: Store customer (tenant) information and SLA tier
+**Purpose**: Store tenant information and SLA tier. Unchanged in v2 except for terminology (concurrency limits now count activities).
 
 ```sql
 CREATE TABLE customers (
     id                  VARCHAR(64) PRIMARY KEY,
     name                VARCHAR(255) NOT NULL,
     tier                VARCHAR(32) NOT NULL CHECK (tier IN ('free', 'standard', 'premium', 'enterprise')),
-    max_concurrent_workloads INT NOT NULL DEFAULT 100,
+    max_concurrent_activities INT NOT NULL DEFAULT 100,
     max_queue_depth     INT NOT NULL DEFAULT 500,
     rate_limit_per_sec  INT NOT NULL DEFAULT 10,
     created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
@@ -107,18 +110,10 @@ CREATE TABLE customers (
 CREATE INDEX idx_customers_tier ON customers(tier);
 ```
 
-**Columns**:
-- `id`: Unique customer identifier (e.g., `cust_abc123`)
-- `name`: Customer display name
-- `tier`: Service tier (determines SLA)
-- `max_concurrent_workloads`: Maximum number of simultaneously running workloads
-- `max_queue_depth`: Maximum pending workloads allowed
-- `rate_limit_per_sec`: API submission rate limit
-- `created_at`, `updated_at`: Audit timestamps
-
 **Tier Characteristics**:
-| Tier | Max Concurrent | Max Queue | Rate Limit | Priority Weight |
-|------|----------------|-----------|------------|-----------------|
+
+| Tier | Max Concurrent Activities | Max Queue | Rate Limit | Priority Weight |
+|------|---------------------------|-----------|------------|-----------------|
 | free | 10 | 50 | 1/sec | 1 |
 | standard | 100 | 500 | 10/sec | 10 |
 | premium | 500 | 2000 | 50/sec | 50 |
@@ -126,61 +121,16 @@ CREATE INDEX idx_customers_tier ON customers(tier);
 
 ---
 
-### 2. Workload Configs Table
+### 2. Activities Table
 
-**Purpose**: Store reusable workload type configurations per customer
-
-```sql
-CREATE TABLE workload_configs (
-    id                  VARCHAR(64) PRIMARY KEY,
-    customer_id         VARCHAR(64) NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-    workload_type       VARCHAR(128) NOT NULL,
-    description         TEXT,
-    config_json         JSONB NOT NULL,
-    resource_limits     JSONB NOT NULL DEFAULT '{"cpu_cores": 1, "memory_mb": 512, "disk_mb": 1024}',
-    checkpoint_interval_sec INT NOT NULL DEFAULT 300,
-    max_retries         INT NOT NULL DEFAULT 3,
-    timeout_seconds     INT NOT NULL DEFAULT 3600,
-    created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    updated_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    UNIQUE(customer_id, workload_type)
-);
-
-CREATE INDEX idx_workload_configs_customer ON workload_configs(customer_id);
-CREATE INDEX idx_workload_configs_type ON workload_configs(workload_type);
-```
-
-**Columns**:
-- `id`: Unique config identifier (e.g., `wlcfg_xyz789`)
-- `customer_id`: Owner of this configuration
-- `workload_type`: Type name (e.g., `video_transcoding`, `report_generation`)
-- `config_json`: Workload-specific configuration (arbitrary JSON)
-- `resource_limits`: CPU, memory, disk limits for this workload type
-- `checkpoint_interval_sec`: How often to checkpoint (0 = manual only)
-- `max_retries`: Retry attempts on transient failures
-- `timeout_seconds`: Maximum execution time before forced termination
-
-**Example `config_json`**:
-```json
-{
-  "input_bucket": "s3://videos-input",
-  "output_bucket": "s3://videos-output",
-  "codec": "h264",
-  "resolution": "1080p"
-}
-```
-
----
-
-### 3. Workloads Table
-
-**Purpose**: Store individual workload instances and their lifecycle state
+**Purpose**: Store each logical unit of work and its lifecycle state. An activity may be a top-level activity or a child dispatched by a parent's `RunChild` call.
 
 ```sql
-CREATE TYPE workload_status AS ENUM (
+CREATE TYPE activity_status AS ENUM (
     'PENDING',
     'SCHEDULED',
     'RUNNING',
+    'SUSPENDED',     -- parked at a RunChild / Sleep / AwaitSignal durable suspend point
     'PAUSED',
     'REDISTRIBUTING',
     'COMPLETED',
@@ -188,21 +138,24 @@ CREATE TYPE workload_status AS ENUM (
     'CANCELLED'
 );
 
-CREATE TABLE workloads (
+CREATE TABLE activities (
     id                  VARCHAR(64) PRIMARY KEY,
     customer_id         VARCHAR(64) NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-    workload_config_id  VARCHAR(64) NOT NULL REFERENCES workload_configs(id),
+    activity_type       VARCHAR(128) NOT NULL,
+    parent_activity_id  VARCHAR(64) REFERENCES activities(id) ON DELETE CASCADE,
+    root_activity_id    VARCHAR(64),                 -- top of the composition tree (for tracing/queries)
     worker_id           VARCHAR(64) REFERENCES workers(id) ON DELETE SET NULL,
-    status              workload_status NOT NULL DEFAULT 'PENDING',
+    status              activity_status NOT NULL DEFAULT 'PENDING',
     priority            INT NOT NULL DEFAULT 10,
     affinity_rules      JSONB,
-    input_params        JSONB NOT NULL,
-    result_data         JSONB,
-    error_message       TEXT,
-    retry_count         INT NOT NULL DEFAULT 0,
-    progress_percent    INT NOT NULL DEFAULT 0 CHECK (progress_percent >= 0 AND progress_percent <= 100),
+    input_json          JSONB NOT NULL,              -- opaque to the engine; meaningful to the activity's app
+    result_json         JSONB,
+    error_json          JSONB,                       -- {message, type: transient|permanent, ...}
+    retry_policy_json   JSONB NOT NULL DEFAULT '{"max_attempts": 3, "backoff": "exponential"}',
     lease_expires_at    TIMESTAMP WITH TIME ZONE,
-    generation          BIGINT NOT NULL DEFAULT 1,
+    generation          BIGINT NOT NULL DEFAULT 1,   -- fencing token, bumped on redistribution
+    suspend_reason      VARCHAR(32),                 -- run_child | sleep | await_signal (when SUSPENDED)
+    wake_at             TIMESTAMP WITH TIME ZONE,     -- for Sleep / AwaitSignal timeout
     created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     scheduled_at        TIMESTAMP WITH TIME ZONE,
     started_at          TIMESTAMP WITH TIME ZONE,
@@ -210,58 +163,119 @@ CREATE TABLE workloads (
     updated_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_workloads_customer ON workloads(customer_id);
-CREATE INDEX idx_workloads_status ON workloads(status);
-CREATE INDEX idx_workloads_worker ON workloads(worker_id) WHERE worker_id IS NOT NULL;
-CREATE INDEX idx_workloads_priority ON workloads(customer_id, status, priority DESC) WHERE status = 'PENDING';
-CREATE INDEX idx_workloads_lease ON workloads(lease_expires_at) WHERE lease_expires_at IS NOT NULL;
+CREATE INDEX idx_activities_customer       ON activities(customer_id);
+CREATE INDEX idx_activities_status         ON activities(status);
+CREATE INDEX idx_activities_worker         ON activities(worker_id) WHERE worker_id IS NOT NULL;
+CREATE INDEX idx_activities_parent         ON activities(parent_activity_id) WHERE parent_activity_id IS NOT NULL;
+CREATE INDEX idx_activities_root           ON activities(root_activity_id);
+CREATE INDEX idx_activities_priority       ON activities(customer_id, status, priority DESC) WHERE status = 'PENDING';
+CREATE INDEX idx_activities_lease          ON activities(lease_expires_at) WHERE lease_expires_at IS NOT NULL;
+CREATE INDEX idx_activities_wake           ON activities(wake_at) WHERE status = 'SUSPENDED' AND wake_at IS NOT NULL;
 ```
 
-**Columns**:
-- `id`: Unique workload identifier (e.g., `wl_abc123`)
-- `customer_id`: Owner of this workload
-- `workload_config_id`: Reference to configuration template
-- `worker_id`: Currently assigned worker (NULL if not assigned)
-- `status`: Current lifecycle state (see state machine in ARCHITECTURE.md)
-- `priority`: Scheduling priority (higher = more urgent); derived from customer tier + explicit priority
-- `affinity_rules`: JSON describing placement constraints (see below)
-- `input_params`: Workload-specific input data (e.g., file paths, parameters)
-- `result_data`: Output data on completion
-- `error_message`: Error details if FAILED
-- `retry_count`: Number of retry attempts so far
-- `progress_percent`: 0-100, updated by worker
-- `lease_expires_at`: Worker must renew before this time or workload is redistributed
-- `generation`: Incremented on each redistribution to prevent split-brain
-- Timestamps for lifecycle events
+**Notes**:
 
-**Example `affinity_rules`**:
+- `activity_type` is registered by an app and advertised by workers as a capability. The engine does not interpret it.
+- `input_json` / `result_json` are opaque payloads — a connector definition or an LLMOps runbook lives here as far as the engine is concerned.
+- `parent_activity_id` makes the composition tree explicit; a `SUSPENDED` parent waiting on a child holds no worker slot.
+- `generation` is the fence token; a stale worker resuming with an old generation is rejected (split-brain prevention).
+- There is no `workload_config_id`. Reusable configuration is an app concern (e.g. the connector definition); the engine stores only the per-activity `input_json`.
+
+**Example `affinity_rules`** (unchanged from v1 semantics, applies to dispatch of any activity, parent or child):
+
 ```json
 {
-  "hard_affinity": {
-    "worker_tags": ["gpu", "us-west-2"]
-  },
-  "soft_affinity": {
-    "worker_id": "worker-5"
-  },
-  "anti_affinity": {
-    "workload_types": ["cpu_intensive"]
-  }
-}
-```
-
-**Example `input_params`**:
-```json
-{
-  "video_url": "s3://input/video123.mp4",
-  "customer_metadata": {"user_id": "user_456"}
+  "hard_affinity": { "worker_tags": ["gpu", "us-west-2"] },
+  "soft_affinity": { "worker_id": "worker-5" },
+  "anti_affinity": { "activity_types": ["cpu_intensive"] }
 }
 ```
 
 ---
 
-### 4. Workers Table
+### 3. Activity Attempts Table
 
-**Purpose**: Track registered workers and their health status
+**Purpose**: One row per physical execution attempt. Replaces the v1 `retry_count` integer with a full per-attempt audit trail — essential for unattended retries.
+
+```sql
+CREATE TABLE activity_attempts (
+    id                  BIGSERIAL PRIMARY KEY,
+    activity_id         VARCHAR(64) NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+    attempt_number      INT NOT NULL,
+    worker_id           VARCHAR(64) REFERENCES workers(id) ON DELETE SET NULL,
+    generation          BIGINT NOT NULL,
+    status              activity_status NOT NULL,
+    error_json          JSONB,
+    started_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    ended_at            TIMESTAMP WITH TIME ZONE,
+    UNIQUE(activity_id, attempt_number)
+);
+
+CREATE INDEX idx_attempts_activity ON activity_attempts(activity_id, attempt_number DESC);
+CREATE INDEX idx_attempts_worker   ON activity_attempts(worker_id) WHERE worker_id IS NOT NULL;
+```
+
+**Invariant**: the `activities` row records the *logical* execution; `activity_attempts` rows record the *physical* retries. The current attempt is `MAX(attempt_number)`.
+
+---
+
+### 4. Activity Calls Table (Call Log)
+
+**Purpose**: The durable record that makes replay-based resume work. Every `RunChild`, `Sleep`, and `AwaitSignal` made by a parent activity is appended here with a deterministic `call_index`. On parent resume, the activity body re-executes from the top; each call checks this log — calls with a recorded result return immediately without re-dispatching (no re-query, no re-spend).
+
+```sql
+CREATE TYPE activity_call_type AS ENUM ('run_child', 'sleep', 'await_signal');
+
+CREATE TABLE activity_calls (
+    id                  BIGSERIAL PRIMARY KEY,
+    activity_id         VARCHAR(64) NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+    call_index          INT NOT NULL,               -- deterministic position in the parent body
+    call_type           activity_call_type NOT NULL,
+    child_activity_id   VARCHAR(64) REFERENCES activities(id) ON DELETE SET NULL,  -- for run_child
+    args_hash           VARCHAR(80),                -- detects nondeterministic divergence on replay
+    result_json         JSONB,                      -- recorded child result / sleep completion / signal payload
+    completed           BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    completed_at        TIMESTAMP WITH TIME ZONE,
+    UNIQUE(activity_id, call_index)
+);
+
+CREATE INDEX idx_calls_activity ON activity_calls(activity_id, call_index);
+CREATE INDEX idx_calls_child    ON activity_calls(child_activity_id) WHERE child_activity_id IS NOT NULL;
+```
+
+**Invariants**:
+
+- `call_index` is assigned in deterministic body order; a replay that produces a different `args_hash` at a given index indicates a determinism violation and fails fast.
+- Replay cost is bounded by call count, not wall-clock duration (a 30-day monitor with 50 calls replays 50 lookups).
+
+---
+
+### 5. Signals Table (Per-Activity Mailbox)
+
+**Purpose**: Durable delivery of external events to a running (or suspended) activity. `ctx.AwaitSignal(name, timeout)` consumes from here. A signal arriving while no worker holds the parent is persisted until the parent resumes.
+
+```sql
+CREATE TABLE signals (
+    id                  BIGSERIAL PRIMARY KEY,
+    activity_id         VARCHAR(64) NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+    name                VARCHAR(128) NOT NULL,
+    payload_json        JSONB,
+    delivered           BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    delivered_at        TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX idx_signals_pending ON signals(activity_id, name) WHERE delivered = FALSE;
+```
+
+**Delivery semantics**: at-least-once with idempotent handlers (see ADR-005 open question). The `SignalBus` interface abstracts the substrate (Postgres LISTEN/NOTIFY or a dedicated table early; NATS JetStream later) without changing activity code.
+
+---
+
+### 6. Workers Table
+
+**Purpose**: Track registered workers and their health. Capabilities now advertise the **activity types** a worker can execute (any app's types).
 
 ```sql
 CREATE TYPE worker_status AS ENUM ('HEALTHY', 'DRAINING', 'DEAD');
@@ -269,7 +283,7 @@ CREATE TYPE worker_status AS ENUM ('HEALTHY', 'DRAINING', 'DEAD');
 CREATE TABLE workers (
     id                  VARCHAR(64) PRIMARY KEY,
     status              worker_status NOT NULL DEFAULT 'HEALTHY',
-    capabilities        JSONB NOT NULL,
+    capabilities        JSONB NOT NULL,             -- {"activity_types": [...], "version": "..."}
     capacity_total      INT NOT NULL,
     capacity_used       INT NOT NULL DEFAULT 0,
     tags                JSONB,
@@ -278,86 +292,49 @@ CREATE TABLE workers (
     updated_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_workers_status ON workers(status);
+CREATE INDEX idx_workers_status    ON workers(status);
 CREATE INDEX idx_workers_heartbeat ON workers(last_heartbeat) WHERE status = 'HEALTHY';
 ```
 
-**Columns**:
-- `id`: Unique worker identifier (e.g., `worker-abc123`)
-- `status`: Current health status
-  - `HEALTHY`: Accepting new workloads
-  - `DRAINING`: Finishing current workloads, no new assignments
-  - `DEAD`: Not responding, workloads should be redistributed
-- `capabilities`: List of supported workload types
-- `capacity_total`: Max concurrent workloads this worker can handle
-- `capacity_used`: Current number of running workloads
-- `tags`: Key-value pairs for affinity matching (e.g., region, hardware)
-- `last_heartbeat`: Timestamp of last heartbeat message
-- Audit timestamps
-
 **Example `capabilities`**:
-```json
-{
-  "supported_workload_types": [
-    "video_transcoding",
-    "image_processing",
-    "report_generation"
-  ],
-  "version": "1.2.3"
-}
-```
 
-**Example `tags`**:
 ```json
-{
-  "region": "us-west-2",
-  "hardware": "gpu",
-  "instance_type": "c5.2xlarge"
-}
+{ "activity_types": ["run_ingestion_partition", "diagnose", "model_call"], "version": "1.2.3" }
 ```
 
 ---
 
-### 5. Checkpoints Table
+### 7. Checkpoints Table (Intra-Attempt Heartbeat State)
 
-**Purpose**: Store workload checkpoints for recovery
+**Purpose**: Optional fine-grained progress *within* a single attempt, persisted via `ctx.Heartbeat(state)`. On retry of the same attempt, `ctx.LastHeartbeat()` returns the last persisted state. This is distinct from replay (which handles cross-`RunChild` resume); checkpoints handle long in-process loops between calls.
 
 ```sql
 CREATE TABLE checkpoints (
     id                  BIGSERIAL PRIMARY KEY,
-    workload_id         VARCHAR(64) NOT NULL REFERENCES workloads(id) ON DELETE CASCADE,
+    activity_id         VARCHAR(64) NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+    attempt_id          BIGINT REFERENCES activity_attempts(id) ON DELETE CASCADE,
     sequence_number     INT NOT NULL,
     checkpoint_data     BYTEA NOT NULL,
     data_size_bytes     INT NOT NULL,
     created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    UNIQUE(workload_id, sequence_number)
+    UNIQUE(activity_id, sequence_number)
 );
 
-CREATE INDEX idx_checkpoints_workload ON checkpoints(workload_id, sequence_number DESC);
+CREATE INDEX idx_checkpoints_activity ON checkpoints(activity_id, sequence_number DESC);
 ```
 
-**Columns**:
-- `id`: Auto-incrementing primary key
-- `workload_id`: Which workload this checkpoint belongs to
-- `sequence_number`: Monotonically increasing checkpoint number (1, 2, 3, ...)
-- `checkpoint_data`: Binary checkpoint data (workload-specific format)
-- `data_size_bytes`: Size of checkpoint_data (for metrics)
-- `created_at`: When this checkpoint was created
-
-**Constraints**:
-- Max checkpoint size: 10MB (enforced at application layer)
-- Keep last 10 checkpoints per workload (older ones deleted)
+**Constraints**: max checkpoint size 10MB (app layer; see [adr/ADR-005-activity-execution-model.md](adr/ADR-005-activity-execution-model.md) ADR-004 in ARCHITECTURE); keep last 10 per activity.
 
 ---
 
-### 6. Audit Events Table
+### 8. Audit Events Table
 
-**Purpose**: Immutable log of all workload lifecycle events
+**Purpose**: Immutable log of activity lifecycle events.
 
 ```sql
 CREATE TABLE audit_events (
     id                  BIGSERIAL PRIMARY KEY,
-    workload_id         VARCHAR(64) NOT NULL REFERENCES workloads(id) ON DELETE CASCADE,
+    activity_id         VARCHAR(64) REFERENCES activities(id) ON DELETE CASCADE,
     customer_id         VARCHAR(64) NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
     event_type          VARCHAR(64) NOT NULL,
     actor_type          VARCHAR(32) NOT NULL CHECK (actor_type IN ('coordinator', 'worker', 'system', 'user')),
@@ -366,55 +343,26 @@ CREATE TABLE audit_events (
     timestamp           TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_audit_events_workload ON audit_events(workload_id, timestamp DESC);
+CREATE INDEX idx_audit_events_activity ON audit_events(activity_id, timestamp DESC);
 CREATE INDEX idx_audit_events_customer ON audit_events(customer_id, timestamp DESC);
-CREATE INDEX idx_audit_events_type ON audit_events(event_type, timestamp DESC);
+CREATE INDEX idx_audit_events_type     ON audit_events(event_type, timestamp DESC);
 ```
-
-**Columns**:
-- `id`: Auto-incrementing primary key
-- `workload_id`: Which workload this event relates to
-- `customer_id`: For cross-customer queries and billing
-- `event_type`: Event name (e.g., `workload.created`, `workload.scheduled`, `workload.completed`)
-- `actor_type`: Who triggered this event
-- `actor_id`: Specific actor (e.g., `worker-5`, `user_789`)
-- `details_json`: Additional context (arbitrary JSON)
-- `timestamp`: When event occurred
 
 **Common Event Types**:
-- `workload.created`
-- `workload.scheduled`
-- `workload.started`
-- `workload.checkpoint_created`
-- `workload.progress_updated`
-- `workload.paused`
-- `workload.resumed`
-- `workload.failed`
-- `workload.completed`
-- `workload.cancelled`
-- `workload.redistributed`
-- `worker.registered`
-- `worker.heartbeat_missed`
-- `worker.marked_dead`
 
-**Example Event**:
-```json
-{
-  "event_type": "workload.redistributed",
-  "details_json": {
-    "from_worker": "worker-3",
-    "to_worker": "worker-7",
-    "reason": "heartbeat_timeout",
-    "checkpoint_sequence": 5
-  }
-}
-```
+- `activity.created`, `activity.scheduled`, `activity.started`
+- `activity.child_dispatched`, `activity.suspended`, `activity.resumed`
+- `activity.signal_received`, `activity.heartbeat`
+- `activity.paused`, `activity.completed`, `activity.failed`, `activity.cancelled`, `activity.redistributed`
+- `worker.registered`, `worker.heartbeat_missed`, `worker.marked_dead`
+
+App-specific audit events (connector upgraded, remediation applied) are written by apps via the same table.
 
 ---
 
-### 7. Coordinator State Table (Leader Election)
+### 9. Coordinator State Table (Leader Election)
 
-**Purpose**: Manage coordinator leader election (if not using etcd)
+**Purpose**: Coordinator leader election when not using etcd. Unchanged from v1.
 
 ```sql
 CREATE TABLE coordinator_state (
@@ -424,19 +372,15 @@ CREATE TABLE coordinator_state (
     updated_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
--- Pre-insert leader lock key
 INSERT INTO coordinator_state (key, value, expires_at)
 VALUES ('leader_lock', '', NOW())
 ON CONFLICT (key) DO NOTHING;
 ```
 
-**Usage**:
 ```sql
--- Try to acquire leader lock
+-- Acquire / renew leader lock
 UPDATE coordinator_state
-SET value = 'coordinator-abc123',
-    expires_at = NOW() + INTERVAL '10 seconds',
-    updated_at = NOW()
+SET value = 'coordinator-abc123', expires_at = NOW() + INTERVAL '10 seconds', updated_at = NOW()
 WHERE key = 'leader_lock'
   AND (expires_at < NOW() OR value = 'coordinator-abc123')
 RETURNING value;
@@ -447,8 +391,6 @@ RETURNING value;
 ## Broker Message Formats
 
 ### Message Envelope
-
-All broker messages use this common structure:
 
 ```go
 type Message struct {
@@ -462,240 +404,85 @@ type Message struct {
 }
 ```
 
----
-
-### 1. Worker Registration Message
-
-**Channel**: `coordinator.events`
-**Type**: `worker.register`
-**Direction**: Worker → Coordinator
+### 1. Worker Registration — `worker.register` (Worker → Coordinator, `coordinator.events`)
 
 ```go
 type WorkerRegistrationPayload struct {
-    WorkerID     string   `json:"worker_id"`
-    Capabilities []string `json:"capabilities"`
-    CapacityTotal int     `json:"capacity_total"`
-    Tags         map[string]string `json:"tags"`
-    Version      string   `json:"version"`
+    WorkerID      string            `json:"worker_id"`
+    ActivityTypes []string          `json:"activity_types"`
+    CapacityTotal int               `json:"capacity_total"`
+    Tags          map[string]string `json:"tags"`
+    Version       string            `json:"version"`
 }
 ```
 
-**Example**:
-```json
-{
-  "message_id": "msg_abc123",
-  "type": "worker.register",
-  "timestamp": "2025-10-27T12:34:56Z",
-  "sender_id": "worker-5",
-  "sender_type": "worker",
-  "payload": {
-    "worker_id": "worker-5",
-    "capabilities": ["video_transcoding", "image_processing"],
-    "capacity_total": 10,
-    "tags": {
-      "region": "us-west-2",
-      "hardware": "gpu"
-    },
-    "version": "1.0.0"
-  }
-}
-```
-
----
-
-### 2. Workload Assignment Message
-
-**Channel**: `worker.{worker_id}.commands`
-**Type**: `workload.assign`
-**Direction**: Coordinator → Worker
+### 2. Activity Assignment — `activity.assign` (Coordinator → Worker, `worker.{id}.commands`)
 
 ```go
-type WorkloadAssignmentPayload struct {
-    WorkloadID       string                 `json:"workload_id"`
-    WorkloadType     string                 `json:"workload_type"`
-    ConfigJSON       map[string]interface{} `json:"config_json"`
-    InputParams      map[string]interface{} `json:"input_params"`
-    CheckpointData   []byte                 `json:"checkpoint_data,omitempty"` // base64 encoded
-    Generation       int64                  `json:"generation"`
-    LeaseSeconds     int                    `json:"lease_seconds"`
+type ActivityAssignmentPayload struct {
+    ActivityID    string                 `json:"activity_id"`
+    ActivityType  string                 `json:"activity_type"`
+    InputJSON     map[string]interface{} `json:"input_json"`
+    Generation    int64                  `json:"generation"`
+    LeaseSeconds  int                    `json:"lease_seconds"`
+    AttemptNumber int                    `json:"attempt_number"`
 }
 ```
 
-**Example**:
-```json
-{
-  "message_id": "msg_xyz789",
-  "type": "workload.assign",
-  "timestamp": "2025-10-27T12:35:00Z",
-  "sender_id": "coordinator-1",
-  "sender_type": "coordinator",
-  "payload": {
-    "workload_id": "wl_abc123",
-    "workload_type": "video_transcoding",
-    "config_json": {
-      "codec": "h264",
-      "resolution": "1080p"
-    },
-    "input_params": {
-      "video_url": "s3://input/video123.mp4"
-    },
-    "generation": 1,
-    "lease_seconds": 60
-  }
-}
-```
+> Secrets are never embedded in `input_json`; workers resolve secret references through approved providers.
 
----
-
-### 3. Heartbeat Message
-
-**Channel**: `worker.{worker_id}.status`
-**Type**: `worker.heartbeat`
-**Direction**: Worker → Coordinator
+### 3. Heartbeat — `worker.heartbeat` (Worker → Coordinator, `worker.{id}.status`)
 
 ```go
 type HeartbeatPayload struct {
-    WorkerID        string   `json:"worker_id"`
-    Status          string   `json:"status"` // "HEALTHY", "DRAINING"
-    CapacityUsed    int      `json:"capacity_used"`
-    CapacityTotal   int      `json:"capacity_total"`
-    RunningWorkloads []string `json:"running_workloads"`
+    WorkerID         string   `json:"worker_id"`
+    Status           string   `json:"status"`            // "HEALTHY" | "DRAINING"
+    CapacityUsed     int      `json:"capacity_used"`
+    CapacityTotal    int      `json:"capacity_total"`
+    RunningActivities []string `json:"running_activities"`
 }
 ```
 
-**Example**:
-```json
-{
-  "message_id": "msg_hb001",
-  "type": "worker.heartbeat",
-  "timestamp": "2025-10-27T12:35:30Z",
-  "sender_id": "worker-5",
-  "sender_type": "worker",
-  "payload": {
-    "worker_id": "worker-5",
-    "status": "HEALTHY",
-    "capacity_used": 3,
-    "capacity_total": 10,
-    "running_workloads": ["wl_abc123", "wl_def456", "wl_ghi789"]
-  }
-}
-```
-
----
-
-### 4. Progress Update Message
-
-**Channel**: `worker.{worker_id}.status`
-**Type**: `workload.progress`
-**Direction**: Worker → Coordinator
+### 4. Progress / Heartbeat State — `activity.progress` (Worker → Coordinator, `worker.{id}.status`)
 
 ```go
 type ProgressUpdatePayload struct {
-    WorkloadID       string `json:"workload_id"`
-    ProgressPercent  int    `json:"progress_percent"`
-    CheckpointSeq    int    `json:"checkpoint_sequence,omitempty"`
-    Message          string `json:"message,omitempty"`
+    ActivityID    string `json:"activity_id"`
+    AttemptNumber int    `json:"attempt_number"`
+    CheckpointSeq int    `json:"checkpoint_sequence,omitempty"`
+    Message       string `json:"message,omitempty"`
 }
 ```
 
-**Example**:
-```json
-{
-  "message_id": "msg_prog001",
-  "type": "workload.progress",
-  "timestamp": "2025-10-27T12:40:00Z",
-  "sender_id": "worker-5",
-  "sender_type": "worker",
-  "payload": {
-    "workload_id": "wl_abc123",
-    "progress_percent": 45,
-    "checkpoint_sequence": 3,
-    "message": "Processed 4500/10000 frames"
-  }
-}
-```
-
----
-
-### 5. Workload Completion Message
-
-**Channel**: `coordinator.events`
-**Type**: `workload.completed` or `workload.failed`
-**Direction**: Worker → Coordinator
+### 5. Child Dispatch / Completion — `activity.child_dispatch`, `activity.completed`, `activity.failed`
 
 ```go
-type WorkloadCompletionPayload struct {
-    WorkloadID   string                 `json:"workload_id"`
-    Status       string                 `json:"status"` // "COMPLETED" or "FAILED"
-    ResultData   map[string]interface{} `json:"result_data,omitempty"`
+type ActivityCompletionPayload struct {
+    ActivityID   string                 `json:"activity_id"`
+    AttemptNumber int                   `json:"attempt_number"`
+    Status       string                 `json:"status"`        // "COMPLETED" | "FAILED"
+    ResultJSON   map[string]interface{} `json:"result_json,omitempty"`
     ErrorMessage string                 `json:"error_message,omitempty"`
-    ErrorType    string                 `json:"error_type,omitempty"` // "transient", "permanent"
+    ErrorType    string                 `json:"error_type,omitempty"` // "transient" | "permanent"
 }
 ```
 
-**Example (Success)**:
-```json
-{
-  "message_id": "msg_comp001",
-  "type": "workload.completed",
-  "timestamp": "2025-10-27T13:00:00Z",
-  "sender_id": "worker-5",
-  "sender_type": "worker",
-  "payload": {
-    "workload_id": "wl_abc123",
-    "status": "COMPLETED",
-    "result_data": {
-      "output_url": "s3://output/video123_transcoded.mp4",
-      "duration_seconds": 1500
-    }
-  }
-}
-```
-
-**Example (Failure)**:
-```json
-{
-  "message_id": "msg_fail001",
-  "type": "workload.failed",
-  "timestamp": "2025-10-27T13:00:00Z",
-  "sender_id": "worker-5",
-  "sender_type": "worker",
-  "payload": {
-    "workload_id": "wl_abc123",
-    "status": "FAILED",
-    "error_message": "Input file not found: s3://input/video123.mp4",
-    "error_type": "permanent"
-  }
-}
-```
-
----
-
-### 6. Workload Cancellation Message
-
-**Channel**: `worker.{worker_id}.commands`
-**Type**: `workload.cancel`
-**Direction**: Coordinator → Worker
+### 6. Activity Cancellation — `activity.cancel` (Coordinator → Worker, `worker.{id}.commands`)
 
 ```go
-type WorkloadCancellationPayload struct {
-    WorkloadID string `json:"workload_id"`
+type ActivityCancellationPayload struct {
+    ActivityID string `json:"activity_id"`
     Reason     string `json:"reason"`
 }
 ```
 
-**Example**:
-```json
-{
-  "message_id": "msg_cancel001",
-  "type": "workload.cancel",
-  "timestamp": "2025-10-27T12:45:00Z",
-  "sender_id": "coordinator-1",
-  "sender_type": "coordinator",
-  "payload": {
-    "workload_id": "wl_abc123",
-    "reason": "User requested cancellation"
-  }
+### 7. Signal Delivery — `activity.signal` (Coordinator → Worker, or internal via SignalBus)
+
+```go
+type SignalPayload struct {
+    ActivityID string                 `json:"activity_id"`
+    Name       string                 `json:"name"`
+    Payload    map[string]interface{} `json:"payload,omitempty"`
 }
 ```
 
@@ -703,31 +490,28 @@ type WorkloadCancellationPayload struct {
 
 ## Go Struct Definitions
 
-### Core Domain Models
-
 ```go
 package models
 
 import (
-    "time"
     "encoding/json"
+    "time"
 )
 
-// WorkloadStatus represents the lifecycle state of a workload
-type WorkloadStatus string
+type ActivityStatus string
 
 const (
-    WorkloadStatusPending        WorkloadStatus = "PENDING"
-    WorkloadStatusScheduled      WorkloadStatus = "SCHEDULED"
-    WorkloadStatusRunning        WorkloadStatus = "RUNNING"
-    WorkloadStatusPaused         WorkloadStatus = "PAUSED"
-    WorkloadStatusRedistributing WorkloadStatus = "REDISTRIBUTING"
-    WorkloadStatusCompleted      WorkloadStatus = "COMPLETED"
-    WorkloadStatusFailed         WorkloadStatus = "FAILED"
-    WorkloadStatusCancelled      WorkloadStatus = "CANCELLED"
+    ActivityStatusPending        ActivityStatus = "PENDING"
+    ActivityStatusScheduled      ActivityStatus = "SCHEDULED"
+    ActivityStatusRunning         ActivityStatus = "RUNNING"
+    ActivityStatusSuspended      ActivityStatus = "SUSPENDED"
+    ActivityStatusPaused         ActivityStatus = "PAUSED"
+    ActivityStatusRedistributing ActivityStatus = "REDISTRIBUTING"
+    ActivityStatusCompleted      ActivityStatus = "COMPLETED"
+    ActivityStatusFailed         ActivityStatus = "FAILED"
+    ActivityStatusCancelled      ActivityStatus = "CANCELLED"
 )
 
-// WorkerStatus represents the health state of a worker
 type WorkerStatus string
 
 const (
@@ -736,7 +520,6 @@ const (
     WorkerStatusDead     WorkerStatus = "DEAD"
 )
 
-// CustomerTier represents the service level tier
 type CustomerTier string
 
 const (
@@ -746,56 +529,37 @@ const (
     TierEnterprise CustomerTier = "enterprise"
 )
 
-// Customer represents a tenant in the system
+// Customer is a tenant.
 type Customer struct {
-    ID                     string       `json:"id" db:"id"`
-    Name                   string       `json:"name" db:"name"`
-    Tier                   CustomerTier `json:"tier" db:"tier"`
-    MaxConcurrentWorkloads int          `json:"max_concurrent_workloads" db:"max_concurrent_workloads"`
-    MaxQueueDepth          int          `json:"max_queue_depth" db:"max_queue_depth"`
-    RateLimitPerSec        int          `json:"rate_limit_per_sec" db:"rate_limit_per_sec"`
-    CreatedAt              time.Time    `json:"created_at" db:"created_at"`
-    UpdatedAt              time.Time    `json:"updated_at" db:"updated_at"`
+    ID                      string       `json:"id" db:"id"`
+    Name                    string       `json:"name" db:"name"`
+    Tier                    CustomerTier `json:"tier" db:"tier"`
+    MaxConcurrentActivities int          `json:"max_concurrent_activities" db:"max_concurrent_activities"`
+    MaxQueueDepth           int          `json:"max_queue_depth" db:"max_queue_depth"`
+    RateLimitPerSec         int          `json:"rate_limit_per_sec" db:"rate_limit_per_sec"`
+    CreatedAt               time.Time    `json:"created_at" db:"created_at"`
+    UpdatedAt               time.Time    `json:"updated_at" db:"updated_at"`
 }
 
-// WorkloadConfig represents a reusable workload type configuration
-type WorkloadConfig struct {
-    ID                    string          `json:"id" db:"id"`
-    CustomerID            string          `json:"customer_id" db:"customer_id"`
-    WorkloadType          string          `json:"workload_type" db:"workload_type"`
-    Description           string          `json:"description" db:"description"`
-    ConfigJSON            json.RawMessage `json:"config_json" db:"config_json"`
-    ResourceLimits        ResourceLimits  `json:"resource_limits" db:"resource_limits"`
-    CheckpointIntervalSec int             `json:"checkpoint_interval_sec" db:"checkpoint_interval_sec"`
-    MaxRetries            int             `json:"max_retries" db:"max_retries"`
-    TimeoutSeconds        int             `json:"timeout_seconds" db:"timeout_seconds"`
-    CreatedAt             time.Time       `json:"created_at" db:"created_at"`
-    UpdatedAt             time.Time       `json:"updated_at" db:"updated_at"`
-}
-
-// ResourceLimits defines resource constraints for a workload
-type ResourceLimits struct {
-    CPUCores int `json:"cpu_cores"`
-    MemoryMB int `json:"memory_mb"`
-    DiskMB   int `json:"disk_mb"`
-}
-
-// Workload represents an individual workload instance
-type Workload struct {
+// Activity is the logical unit of work.
+type Activity struct {
     ID               string          `json:"id" db:"id"`
     CustomerID       string          `json:"customer_id" db:"customer_id"`
-    WorkloadConfigID string          `json:"workload_config_id" db:"workload_config_id"`
+    ActivityType     string          `json:"activity_type" db:"activity_type"`
+    ParentActivityID *string         `json:"parent_activity_id,omitempty" db:"parent_activity_id"`
+    RootActivityID   *string         `json:"root_activity_id,omitempty" db:"root_activity_id"`
     WorkerID         *string         `json:"worker_id,omitempty" db:"worker_id"`
-    Status           WorkloadStatus  `json:"status" db:"status"`
+    Status           ActivityStatus  `json:"status" db:"status"`
     Priority         int             `json:"priority" db:"priority"`
     AffinityRules    *AffinityRules  `json:"affinity_rules,omitempty" db:"affinity_rules"`
-    InputParams      json.RawMessage `json:"input_params" db:"input_params"`
-    ResultData       json.RawMessage `json:"result_data,omitempty" db:"result_data"`
-    ErrorMessage     string          `json:"error_message,omitempty" db:"error_message"`
-    RetryCount       int             `json:"retry_count" db:"retry_count"`
-    ProgressPercent  int             `json:"progress_percent" db:"progress_percent"`
+    InputJSON        json.RawMessage `json:"input_json" db:"input_json"`
+    ResultJSON       json.RawMessage `json:"result_json,omitempty" db:"result_json"`
+    ErrorJSON        json.RawMessage `json:"error_json,omitempty" db:"error_json"`
+    RetryPolicyJSON  json.RawMessage `json:"retry_policy_json" db:"retry_policy_json"`
     LeaseExpiresAt   *time.Time      `json:"lease_expires_at,omitempty" db:"lease_expires_at"`
     Generation       int64           `json:"generation" db:"generation"`
+    SuspendReason    *string         `json:"suspend_reason,omitempty" db:"suspend_reason"`
+    WakeAt           *time.Time      `json:"wake_at,omitempty" db:"wake_at"`
     CreatedAt        time.Time       `json:"created_at" db:"created_at"`
     ScheduledAt      *time.Time      `json:"scheduled_at,omitempty" db:"scheduled_at"`
     StartedAt        *time.Time      `json:"started_at,omitempty" db:"started_at"`
@@ -803,47 +567,81 @@ type Workload struct {
     UpdatedAt        time.Time       `json:"updated_at" db:"updated_at"`
 }
 
-// AffinityRules defines workload placement constraints
+// ActivityAttempt is one physical execution attempt.
+type ActivityAttempt struct {
+    ID            int64           `json:"id" db:"id"`
+    ActivityID    string          `json:"activity_id" db:"activity_id"`
+    AttemptNumber int             `json:"attempt_number" db:"attempt_number"`
+    WorkerID      *string         `json:"worker_id,omitempty" db:"worker_id"`
+    Generation    int64           `json:"generation" db:"generation"`
+    Status        ActivityStatus  `json:"status" db:"status"`
+    ErrorJSON     json.RawMessage `json:"error_json,omitempty" db:"error_json"`
+    StartedAt     time.Time       `json:"started_at" db:"started_at"`
+    EndedAt       *time.Time      `json:"ended_at,omitempty" db:"ended_at"`
+}
+
+// ActivityCall is one row in the durable call log used for replay.
+type ActivityCall struct {
+    ID              int64           `json:"id" db:"id"`
+    ActivityID      string          `json:"activity_id" db:"activity_id"`
+    CallIndex       int             `json:"call_index" db:"call_index"`
+    CallType        string          `json:"call_type" db:"call_type"` // run_child | sleep | await_signal
+    ChildActivityID *string         `json:"child_activity_id,omitempty" db:"child_activity_id"`
+    ArgsHash        string          `json:"args_hash,omitempty" db:"args_hash"`
+    ResultJSON      json.RawMessage `json:"result_json,omitempty" db:"result_json"`
+    Completed       bool            `json:"completed" db:"completed"`
+    CreatedAt       time.Time       `json:"created_at" db:"created_at"`
+    CompletedAt     *time.Time      `json:"completed_at,omitempty" db:"completed_at"`
+}
+
+// Signal is one entry in an activity's durable mailbox.
+type Signal struct {
+    ID          int64           `json:"id" db:"id"`
+    ActivityID  string          `json:"activity_id" db:"activity_id"`
+    Name        string          `json:"name" db:"name"`
+    PayloadJSON json.RawMessage `json:"payload_json,omitempty" db:"payload_json"`
+    Delivered   bool            `json:"delivered" db:"delivered"`
+    CreatedAt   time.Time       `json:"created_at" db:"created_at"`
+    DeliveredAt *time.Time      `json:"delivered_at,omitempty" db:"delivered_at"`
+}
+
 type AffinityRules struct {
     HardAffinity *AffinityConstraint `json:"hard_affinity,omitempty"`
     SoftAffinity *AffinityConstraint `json:"soft_affinity,omitempty"`
     AntiAffinity *AffinityConstraint `json:"anti_affinity,omitempty"`
 }
 
-// AffinityConstraint specifies placement rules
 type AffinityConstraint struct {
-    WorkerID       string            `json:"worker_id,omitempty"`
-    WorkerTags     map[string]string `json:"worker_tags,omitempty"`
-    WorkloadTypes  []string          `json:"workload_types,omitempty"`
+    WorkerID      string            `json:"worker_id,omitempty"`
+    WorkerTags    map[string]string `json:"worker_tags,omitempty"`
+    ActivityTypes []string          `json:"activity_types,omitempty"`
 }
 
-// Worker represents a workload execution node
 type Worker struct {
-    ID             string         `json:"id" db:"id"`
-    Status         WorkerStatus   `json:"status" db:"status"`
-    Capabilities   []string       `json:"capabilities" db:"capabilities"`
-    CapacityTotal  int            `json:"capacity_total" db:"capacity_total"`
-    CapacityUsed   int            `json:"capacity_used" db:"capacity_used"`
-    Tags           map[string]string `json:"tags" db:"tags"`
-    LastHeartbeat  time.Time      `json:"last_heartbeat" db:"last_heartbeat"`
-    RegisteredAt   time.Time      `json:"registered_at" db:"registered_at"`
-    UpdatedAt      time.Time      `json:"updated_at" db:"updated_at"`
+    ID            string            `json:"id" db:"id"`
+    Status        WorkerStatus      `json:"status" db:"status"`
+    ActivityTypes []string          `json:"activity_types" db:"-"`
+    CapacityTotal int               `json:"capacity_total" db:"capacity_total"`
+    CapacityUsed  int               `json:"capacity_used" db:"capacity_used"`
+    Tags          map[string]string `json:"tags" db:"tags"`
+    LastHeartbeat time.Time         `json:"last_heartbeat" db:"last_heartbeat"`
+    RegisteredAt  time.Time         `json:"registered_at" db:"registered_at"`
+    UpdatedAt     time.Time         `json:"updated_at" db:"updated_at"`
 }
 
-// Checkpoint represents a saved workload state
 type Checkpoint struct {
-    ID              int64     `json:"id" db:"id"`
-    WorkloadID      string    `json:"workload_id" db:"workload_id"`
-    SequenceNumber  int       `json:"sequence_number" db:"sequence_number"`
-    CheckpointData  []byte    `json:"checkpoint_data" db:"checkpoint_data"`
-    DataSizeBytes   int       `json:"data_size_bytes" db:"data_size_bytes"`
-    CreatedAt       time.Time `json:"created_at" db:"created_at"`
+    ID             int64     `json:"id" db:"id"`
+    ActivityID     string    `json:"activity_id" db:"activity_id"`
+    AttemptID      *int64    `json:"attempt_id,omitempty" db:"attempt_id"`
+    SequenceNumber int       `json:"sequence_number" db:"sequence_number"`
+    CheckpointData []byte    `json:"checkpoint_data" db:"checkpoint_data"`
+    DataSizeBytes  int       `json:"data_size_bytes" db:"data_size_bytes"`
+    CreatedAt      time.Time `json:"created_at" db:"created_at"`
 }
 
-// AuditEvent represents an immutable lifecycle event
 type AuditEvent struct {
     ID          int64           `json:"id" db:"id"`
-    WorkloadID  string          `json:"workload_id" db:"workload_id"`
+    ActivityID  *string         `json:"activity_id,omitempty" db:"activity_id"`
     CustomerID  string          `json:"customer_id" db:"customer_id"`
     EventType   string          `json:"event_type" db:"event_type"`
     ActorType   string          `json:"actor_type" db:"actor_type"`
@@ -857,24 +655,37 @@ type AuditEvent struct {
 
 ## Data Validation Rules
 
-### Workload Validation
+### Activity Validation
 
 ```go
-func (w *Workload) Validate() error {
-    if w.ID == "" || !strings.HasPrefix(w.ID, "wl_") {
-        return errors.New("invalid workload ID")
+func (a *Activity) Validate() error {
+    if a.ID == "" || !strings.HasPrefix(a.ID, "act_") {
+        return errors.New("invalid activity ID")
     }
-    if w.CustomerID == "" {
+    if a.CustomerID == "" {
         return errors.New("customer_id required")
     }
-    if w.WorkloadConfigID == "" {
-        return errors.New("workload_config_id required")
+    if a.ActivityType == "" {
+        return errors.New("activity_type required")
     }
-    if w.Priority < 0 || w.Priority > 1000 {
+    if a.Priority < 0 || a.Priority > 1000 {
         return errors.New("priority must be between 0 and 1000")
     }
-    if w.ProgressPercent < 0 || w.ProgressPercent > 100 {
-        return errors.New("progress_percent must be between 0 and 100")
+    return nil
+}
+```
+
+### Call Log Determinism Check (on replay)
+
+```go
+// During replay, the re-executed body must produce the same call sequence.
+func (c *ActivityCall) AssertReplayMatch(observedType string, observedArgsHash string) error {
+    if c.CallType != observedType {
+        return fmt.Errorf("determinism violation at call_index %d: logged %s, replayed %s",
+            c.CallIndex, c.CallType, observedType)
+    }
+    if c.ArgsHash != "" && c.ArgsHash != observedArgsHash {
+        return fmt.Errorf("determinism violation at call_index %d: args changed on replay", c.CallIndex)
     }
     return nil
 }
@@ -886,8 +697,8 @@ func (w *Workload) Validate() error {
 const MaxCheckpointSize = 10 * 1024 * 1024 // 10MB
 
 func (c *Checkpoint) Validate() error {
-    if c.WorkloadID == "" {
-        return errors.New("workload_id required")
+    if c.ActivityID == "" {
+        return errors.New("activity_id required")
     }
     if c.SequenceNumber < 1 {
         return errors.New("sequence_number must be positive")
@@ -906,85 +717,43 @@ func (c *Checkpoint) Validate() error {
 
 ## Indexing Strategy
 
-### Critical Indexes for Performance
-
-1. **Workload Scheduling Query**:
-```sql
--- Coordinator queries for workloads to schedule
-EXPLAIN SELECT * FROM workloads
-WHERE customer_id = $1
-  AND status = 'PENDING'
-ORDER BY priority DESC, created_at ASC
-LIMIT 100;
-```
-**Index**: `idx_workloads_priority` (composite on customer_id, status, priority DESC)
-
-2. **Worker Lease Expiration Check**:
-```sql
--- Coordinator finds expired leases
-SELECT * FROM workloads
-WHERE status = 'RUNNING'
-  AND lease_expires_at < NOW();
-```
-**Index**: `idx_workloads_lease` (on lease_expires_at with partial index)
-
-3. **Audit Log Queries**:
-```sql
--- User queries workload history
-SELECT * FROM audit_events
-WHERE workload_id = $1
-ORDER BY timestamp DESC
-LIMIT 50;
-```
-**Index**: `idx_audit_events_workload` (composite on workload_id, timestamp DESC)
+1. **Activity scheduling query** — `idx_activities_priority` (customer_id, status, priority DESC) for `PENDING` selection.
+2. **Lease expiration sweep** — `idx_activities_lease` finds expired `RUNNING` leases for redistribution.
+3. **Wake sweep** — `idx_activities_wake` finds `SUSPENDED` activities whose `Sleep`/`AwaitSignal` timeout is due.
+4. **Replay lookup** — `idx_calls_activity` (activity_id, call_index) for the per-call log scan on resume.
+5. **Pending signal lookup** — `idx_signals_pending` for `AwaitSignal` delivery.
+6. **Audit queries** — `idx_audit_events_activity`, `idx_audit_events_customer`.
 
 ---
 
 ## Data Retention Policies
 
-### Cleanup Rules
+| Table | Retention | Cleanup Method |
+|-------|-----------|----------------|
+| `activities` | Keep terminal (COMPLETED/FAILED/CANCELLED) 90 days | Nightly archive to cold storage |
+| `activity_attempts` | Follows parent activity | Cascade on archive |
+| `activity_calls` | Follows parent activity | Cascade on archive |
+| `signals` | Delete delivered after 7 days | Nightly cleanup |
+| `checkpoints` | Keep last 10 per activity | On new checkpoint, prune older |
+| `audit_events` | Keep 1 year | Monthly partition drop |
+| `workers` | Delete DEAD after 7 days | Nightly cleanup |
 
-| Table | Retention Policy | Cleanup Method |
-|-------|------------------|----------------|
-| `workloads` | Keep COMPLETED/FAILED for 90 days | Nightly job archives to cold storage |
-| `checkpoints` | Keep last 10 per workload | On new checkpoint, delete old ones |
-| `audit_events` | Keep for 1 year | Monthly partition drops |
-| `workers` | Delete DEAD workers after 7 days | Nightly cleanup job |
-
-### Archival Strategy
-
-**Completed Workloads**:
-- After 90 days, move to `workloads_archive` table (same schema)
-- Archive table uses table partitioning by completion month
-- Audit events remain in primary table (longer retention)
-
-**Example Cleanup Job** (run daily):
 ```sql
--- Archive old workloads
-INSERT INTO workloads_archive
-SELECT * FROM workloads
+-- Archive terminal activities (cascades attempts/calls)
+INSERT INTO activities_archive
+SELECT * FROM activities
 WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED')
   AND completed_at < NOW() - INTERVAL '90 days';
 
-DELETE FROM workloads
+DELETE FROM activities
 WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED')
   AND completed_at < NOW() - INTERVAL '90 days';
 
--- Delete old checkpoints (keep last 10)
-DELETE FROM checkpoints
-WHERE id IN (
-  SELECT id FROM checkpoints c1
-  WHERE (
-    SELECT COUNT(*) FROM checkpoints c2
-    WHERE c2.workload_id = c1.workload_id
-      AND c2.sequence_number >= c1.sequence_number
-  ) > 10
-);
+-- Prune delivered signals
+DELETE FROM signals WHERE delivered = TRUE AND delivered_at < NOW() - INTERVAL '7 days';
 
 -- Delete old dead workers
-DELETE FROM workers
-WHERE status = 'DEAD'
-  AND updated_at < NOW() - INTERVAL '7 days';
+DELETE FROM workers WHERE status = 'DEAD' AND updated_at < NOW() - INTERVAL '7 days';
 ```
 
 ---
@@ -993,38 +762,45 @@ WHERE status = 'DEAD'
 
 ### Transaction Boundaries
 
-**Workload State Transitions** (atomic):
-```go
+**Activity state transition** (atomic):
+
+```
 tx.Begin()
-  - Update workload status
-  - Insert audit event
-  - Update worker capacity_used (if applicable)
+  - Update activities.status (+ generation on redistribution)
+  - Insert activity_attempts row (on new attempt)
+  - Insert audit_event
+  - Update workers.capacity_used (if applicable)
 tx.Commit()
 ```
 
-**Checkpoint Creation** (atomic):
-```go
+**RunChild dispatch** (atomic — the durable suspend point):
+
+```
 tx.Begin()
-  - Insert checkpoint
-  - Update workload progress_percent
-  - Insert audit event
+  - Insert activity_calls row (call_index, run_child, child_activity_id, completed=false)
+  - Insert child activities row (status=PENDING, parent_activity_id set)
+  - Update parent activities.status = SUSPENDED, suspend_reason = run_child
+  - Free parent worker slot
 tx.Commit()
 ```
+
+**RunChild result record** (atomic — parent re-dispatch):
+
+```
+tx.Begin()
+  - Update activity_calls.result_json, completed=true
+  - Update parent activities.status = SCHEDULED (re-dispatch for replay)
+tx.Commit()
+```
+
+**Idempotency**: only `RunChild` dispatch must be idempotent — a parent crash between dispatch and result-record may re-invoke a child. Children carry their own attempt boundary.
 
 ### Idempotency Keys
 
-For API requests that mutate state, use idempotency keys to prevent duplicate submissions:
-
-```go
-type WorkloadSubmission struct {
-    IdempotencyKey string `json:"idempotency_key"` // UUID generated by client
-    // ... other fields
-}
-
-// In database, track processed idempotency keys
+```sql
 CREATE TABLE idempotency_keys (
     key         VARCHAR(64) PRIMARY KEY,
-    workload_id VARCHAR(64) NOT NULL,
+    activity_id VARCHAR(64) NOT NULL,
     created_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
@@ -1035,49 +811,81 @@ CREATE INDEX idx_idempotency_created ON idempotency_keys(created_at);
 
 ## Schema Migration Strategy
 
-Use **golang-migrate** or similar tool for versioned migrations.
+Use **golang-migrate** for versioned migrations. Conventions:
 
-**Example Migration (001_initial_schema.up.sql)**:
+- One numbered pair per change: `NNN_description.up.sql` / `NNN_description.down.sql`.
+- Each migration wrapped in `BEGIN; … COMMIT;`. Down migration must reverse the up.
+- **Phase map** (which migration introduces what; mirrors [../IMPLEMENTATION_PLAN.md](../IMPLEMENTATION_PLAN.md) and the platform impl phases):
+
+| Migration | Phase | Introduces |
+|-----------|-------|-----------|
+| `001_core` | Platform Phase 1 | `customers`, `activities`, `activity_attempts`, `workers`, `checkpoints`, `audit_events` |
+| `002_call_log` | Platform Phase 3 | `activity_calls` + replay indexes |
+| `003_signals` | Platform Phase 4 | `signals` mailbox + pending index |
+| `004_coordinator_state` | Platform Phase 6 | `coordinator_state` (if Postgres-based leader election) |
+| app migrations | dataconnector P5 / llmops P1+ | app tables (`connector_*`, `llmops_*`) — owned by the app, never altering core tables |
+
 ```sql
+-- 001_core.up.sql
 BEGIN;
-
+CREATE TYPE activity_status AS ENUM (...);
 CREATE TABLE customers ( ... );
-CREATE TABLE workload_configs ( ... );
--- ... all tables
-
-CREATE INDEX idx_workloads_priority ON workloads(...);
--- ... all indexes
-
+CREATE TABLE activities ( ... );
+CREATE TABLE activity_attempts ( ... );
+-- ... indexes
 COMMIT;
 ```
 
-**Rollback (001_initial_schema.down.sql)**:
 ```sql
+-- 001_core.down.sql
 BEGIN;
-
 DROP TABLE IF EXISTS audit_events CASCADE;
 DROP TABLE IF EXISTS checkpoints CASCADE;
-DROP TABLE IF EXISTS workloads CASCADE;
+DROP TABLE IF EXISTS activity_attempts CASCADE;
+DROP TABLE IF EXISTS activities CASCADE;
 DROP TABLE IF EXISTS workers CASCADE;
-DROP TABLE IF EXISTS workload_configs CASCADE;
 DROP TABLE IF EXISTS customers CASCADE;
-
+DROP TYPE IF EXISTS activity_status;
 COMMIT;
 ```
+
+**Rollback policy**: app tables are dropped before platform tables; never drop a core table while an app table references it. Breaking changes to the call-log or signal shape require a new migration plus a replay-compatibility note (see ADR-005 on checkpoint/state migration).
+
+---
+
+## Appendix: v1 → v2 Migration Map
+
+For anyone holding the old workload vocabulary:
+
+| v1 (workload model) | v2 (activity model, ADR-005) | Note |
+|---------------------|------------------------------|------|
+| `workloads` | `activities` | Adds `parent_activity_id`, `root_activity_id`, `suspend_reason`, `wake_at` |
+| `workload_configs` | *(removed)* | Reusable config is an app concern (e.g. connector definition); engine stores per-activity `input_json` only |
+| `workload_status` enum | `activity_status` enum | Adds `SUSPENDED` (durable suspend point) |
+| `workloads.retry_count` (int) | `activity_attempts` (table) | One row per physical attempt |
+| `workloads.input_params` | `activities.input_json` | Opaque to engine |
+| `workloads.result_data` | `activities.result_json` | |
+| `workloads.error_message` | `activities.error_json` | Structured `{message, type}` |
+| *(none)* | `activity_calls` | New: durable call log for replay |
+| *(none)* | `signals` | New: per-activity mailbox |
+| `checkpoints.workload_id` | `checkpoints.activity_id` + `attempt_id` | Now scoped to attempt (heartbeat semantics) |
+| `workers.capabilities.supported_workload_types` | `workers.capabilities.activity_types` | Advertises any app's activity types |
+| `customers.max_concurrent_workloads` | `customers.max_concurrent_activities` | |
 
 ---
 
 ## Future Considerations
 
-1. **Sharding**: If single PostgreSQL instance becomes bottleneck, shard by `customer_id`
-2. **Large Checkpoints**: Store checkpoints > 10MB in S3, keep reference in database
-3. **Metrics Aggregation**: Pre-aggregate common queries (per-customer stats) in materialized views
-4. **Read Replicas**: Offload audit log queries and dashboard queries to read replicas
+1. **Sharding**: shard by `customer_id` if a single PostgreSQL instance becomes the bottleneck.
+2. **Large checkpoints**: store > 10MB checkpoints in S3, keep a reference in `checkpoints` (ADR-004, Phase 2).
+3. **Replay performance**: for activities with very high call counts, batch `RunChild` calls or tune per-call-site replay keys (ADR-005 engine Phase 4).
+4. **Read replicas**: offload audit and dashboard queries.
 
 ---
 
 ## References
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture overview
-- [API_SPEC.md](API_SPEC.md) - API contracts
-- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) - Phased delivery plan
+- [adr/ADR-005-activity-execution-model.md](adr/ADR-005-activity-execution-model.md) - the canonical activity execution model
+- [ARCHITECTURE.md](ARCHITECTURE.md) - platform architecture overview
+- [API_SPEC.md](API_SPEC.md) - engine API contracts
+- [../IMPLEMENTATION_PLAN.md](../IMPLEMENTATION_PLAN.md) - phased delivery plan

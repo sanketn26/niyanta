@@ -322,6 +322,43 @@ Control precedence:
 
 The planner must read active controls before creating runs. Workers must still enforce per-request rate limits defensively, but global decisions belong to the planner.
 
+## Data Flow
+
+This is the primary product flow, built on the engine's activity primitives (submit, `RunChild`, `Sleep`, checkpoint, redistribute — see [../../platform/ARCHITECTURE.md](../../platform/ARCHITECTURE.md) §Data Flow). A customer creates a connector connection once; the Data Connector composition owns ongoing run creation, partitioning, checkpointing, retries, backoff, and health transitions.
+
+```
+Operator/API        Coordinator          State Store       Planner/Scheduler       Worker          Destination
+    │                   │                    │                    │                  │                  │
+    │ Create connection │                    │                    │                  │                  │
+    ├──────────────────>│                    │                    │                  │                  │
+    │                   │ Validate config    │                    │                  │                  │
+    │                   │ and secret refs    │                    │                  │                  │
+    │                   ├───────────────────>│                    │                  │                  │
+    │                   │ Reconcile enabled connection            │                  │                  │
+    │                   ├────────────────────────────────────────>│                  │                  │
+    │                   │                    │                    │ Plan windows,    │                  │
+    │                   │                    │                    │ partitions, lag  │                  │
+    │                   │                    │<───────────────────┤                  │                  │
+    │                   │                    │ Create ConnectorRun│                  │                  │
+    │                   │                    │ and activity       │                  │                  │
+    │                   │                    │<───────────────────┤                  │                  │
+    │                   │                    │                    │ Assign attempt   │                  │
+    │                   │                    │                    ├─────────────────>│                  │
+    │                   │                    │                    │                  │ Read source,     │
+    │                   │                    │                    │                  │ parse, transform │
+    │                   │                    │                    │                  │ dedupe, batch    │
+    │                   │                    │                    │                  ├─────────────────>│
+    │                   │                    │                    │                  │ Delivery ack     │
+    │                   │                    │                    │                  │<─────────────────┤
+    │                   │                    │ Commit checkpoint  │                  │                  │
+    │                   │                    │<───────────────────────────────────────┤                  │
+    │                   │                    │                    │ Health feedback  │                  │
+    │                   │<───────────────────────────────────────────────────────────┤                  │
+    │                   │ Adapt next poll/backfill/concurrency    │                  │                  │
+```
+
+The connection reconciliation, planner, and scheduler shown here are **app activities and app state**, not engine components — the engine sees a supervisor activity that sleeps, wakes, and runs child partition activities.
+
 ## Data Plane Stages
 
 Every ingestion run follows the same staged pipeline:
@@ -474,7 +511,7 @@ See [OPERATIONS_AND_FAILURE_SEMANTICS.md](OPERATIONS_AND_FAILURE_SEMANTICS.md) f
 
 Use this document as the north star for ingestion-specific design. The lower-level activity docs remain valid, but should be read as implementation mechanics:
 
-- [ARCHITECTURE.md](ARCHITECTURE.md): platform architecture and deployment shape.
+- [ARCHITECTURE.md](../../platform/ARCHITECTURE.md): platform architecture and deployment shape.
 - [DATA_CONNECTOR_SPEC.md](DATA_CONNECTOR_SPEC.md): connector definition schema and runtime contract.
-- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md): phased build plan.
-- [adr/ADR-005-activity-execution-model.md](adr/ADR-005-activity-execution-model.md): durable activity substrate.
+- [IMPLEMENTATION_PLAN.md](../../IMPLEMENTATION_PLAN.md): phased build plan.
+- [adr/ADR-005-activity-execution-model.md](../../platform/adr/ADR-005-activity-execution-model.md): durable activity substrate.

@@ -1,0 +1,36 @@
+{
+  "name": "source_429_with_token_in_message",
+  "description": "Secret token in an error message URL, plus a sample record with PII and secret refs. Verifies value-redaction of URLs/secrets and whole-category drop of payloads/refs.",
+  "input": {
+    "connection_id": "conn_123",
+    "connector_definition_id": "github_audit",
+    "health": "degraded",
+    "metrics": { "source_lag_seconds": 900, "rate_limit_backoffs_1h": 7 },
+    "events": [
+      { "event_type": "source_rate_limited", "severity": "warning", "message": "429 from https://api.vendor.com/events?token=abc123secret&page=4; retry-after 60" },
+      { "event_type": "auth_refresh", "severity": "info", "message": "Authorization: Bearer eyJhbGciOiJ.IUzI1NiIsInR5 refreshed" }
+    ],
+    "secret_refs": { "api_token": "secret://cust_abc/github-prod-token" },
+    "sample_record": { "actor": "alice@example.com", "ip": "203.0.113.7", "ssn": "123-45-6789" }
+  },
+  "expected": {
+    "connection_id": "conn_123",
+    "connector_definition_id": "github_audit",
+    "health": "degraded",
+    "metrics": { "source_lag_seconds": 900, "rate_limit_backoffs_1h": 7 },
+    "events": [
+      { "event_type": "source_rate_limited", "severity": "warning", "message": "429 from https://api.vendor.com/events?<redacted>; retry-after 60" },
+      { "event_type": "auth_refresh", "severity": "info", "message": "Authorization: <redacted> refreshed" }
+    ]
+  },
+  "must_not_contain": [
+    "abc123secret",
+    "eyJhbGciOiJ.IUzI1NiIsInR5",
+    "secret://cust_abc/github-prod-token",
+    "alice@example.com",
+    "203.0.113.7",
+    "123-45-6789",
+    "sample_record",
+    "secret_refs"
+  ]
+}

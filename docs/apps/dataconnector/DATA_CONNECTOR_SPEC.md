@@ -1226,34 +1226,7 @@ connections:
 
 ## API Extensions
 
-Minimum coordinator APIs:
-
-- `POST /connector-definitions`
-- `GET /connector-definitions`
-- `GET /connector-definitions/{id}/versions/{version}`
-- `POST /connector-definitions:import`
-- `POST /connector-connections`
-- `GET /connector-connections`
-- `GET /connector-connections/{id}`
-- `PATCH /connector-connections/{id}`
-- `POST /connector-connections/{id}:test`
-- `POST /connector-connections/{id}:discover`
-- `GET /connector-connections/{id}/catalog`
-- `PATCH /connector-connections/{id}/catalog`
-- `POST /connector-connections/{id}:run`
-- `POST /connector-connections/{id}:pause`
-- `POST /connector-connections/{id}:resume`
-- `POST /connector-connections/{id}:rate-limit`
-- `POST /connector-connections/{id}:temporary-disable`
-- `POST /connector-connections/{id}:clear-control`
-- `GET /connector-connections/{id}/controls`
-- `GET /connector-connections/{id}/runs`
-- `GET /connector-runs/{id}`
-- `GET /customers/{customer_id}/ingestion-view`
-- `POST /customers/{customer_id}/ingestion-event-filters`
-- `GET /customers/{customer_id}/ingestion-event-filters`
-- `PATCH /customers/{customer_id}/ingestion-event-filters/{filter_id}`
-- `GET /customers/{customer_id}/ingestion-events`
+The full Data Connector API — request/response bodies, auth, pagination, errors, and idempotency — is specified in [API_SPEC.md](API_SPEC.md). It is the app's own surface, layered on the engine's activity API ([../../platform/API_SPEC.md](../../platform/API_SPEC.md)), and covers connector definitions, connections, test/discover/catalog, runs/backfills, controls, the customer ingestion view, and significant-event filters.
 
 ## Worker Runtime Contract
 

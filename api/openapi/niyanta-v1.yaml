@@ -1,0 +1,275 @@
+openapi: 3.1.0
+info:
+  title: Niyanta Engine API
+  version: 2.0.0
+  description: >
+    The Niyanta platform (composable activity runner) API. Engine-only: activities,
+    workers, and health. App APIs (data connector, LLMOps) are separate documents.
+    Source of truth for engine request/response shapes; see docs/platform/API_SPEC.md.
+servers:
+  - url: https://api.niyanta.example.com/v1
+security:
+  - apiKey: []
+tags:
+  - name: activities
+  - name: customers
+  - name: workers
+  - name: health
+
+paths:
+  /activities:
+    post:
+      tags: [activities]
+      summary: Submit a top-level activity
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActivitySubmitRequest' }
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActivitySubmitResponse' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+    get:
+      tags: [activities]
+      summary: List activities
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/ActivityStatus' } }
+        - { name: activity_type, in: query, schema: { type: string } }
+        - { name: parent_activity_id, in: query, schema: { type: string } }
+        - { name: root_activity_id, in: query, schema: { type: string } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  activities: { type: array, items: { $ref: '#/components/schemas/Activity' } }
+                  next_cursor: { type: [string, 'null'] }
+
+  /activities/{activity_id}:
+    get:
+      tags: [activities]
+      summary: Get an activity
+      parameters: [ { $ref: '#/components/parameters/ActivityId' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Activity' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /activities/{activity_id}:cancel:
+    post:
+      tags: [activities]
+      summary: Cancel an activity and its in-flight children
+      parameters: [ { $ref: '#/components/parameters/ActivityId' } ]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { reason: { type: string } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Activity' } } } }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /activities/{activity_id}:signal:
+    post:
+      tags: [activities]
+      summary: Deliver an external signal to an activity
+      parameters: [ { $ref: '#/components/parameters/ActivityId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                payload: { type: object, additionalProperties: true }
+      responses:
+        '200': { description: OK }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /activities/{activity_id}/attempts:
+    get:
+      tags: [activities]
+      summary: Get the per-attempt audit trail
+      parameters: [ { $ref: '#/components/parameters/ActivityId' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  attempts: { type: array, items: { $ref: '#/components/schemas/ActivityAttempt' } }
+
+  /customers/{customer_id}:
+    get:
+      tags: [customers]
+      summary: Get customer info and limits
+      parameters: [ { name: customer_id, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '200': { description: OK }
+
+  /workers:
+    get:
+      tags: [workers]
+      summary: List workers (admin)
+      responses:
+        '200': { description: OK }
+
+  /health:
+    get:
+      tags: [health]
+      summary: Liveness
+      security: []
+      responses:
+        '200': { description: OK }
+  /ready:
+    get:
+      tags: [health]
+      summary: Readiness
+      security: []
+      responses:
+        '200': { description: Ready }
+        '503': { description: Not ready }
+  /metrics:
+    get:
+      tags: [health]
+      summary: Prometheus metrics
+      security: []
+      responses:
+        '200': { description: OK, content: { text/plain: {} } }
+
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      description: 'Authorization: Bearer nyt_<customer_id>_<random>'
+
+  parameters:
+    ActivityId:
+      name: activity_id
+      in: path
+      required: true
+      schema: { type: string }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, default: 50, maximum: 100 }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    ActivityStatus:
+      type: string
+      enum: [PENDING, SCHEDULED, RUNNING, SUSPENDED, PAUSED, REDISTRIBUTING, COMPLETED, FAILED, CANCELLED]
+    RetryPolicy:
+      type: object
+      properties:
+        max_attempts: { type: integer, default: 3 }
+        backoff: { type: string, enum: [exponential, linear, none], default: exponential }
+    AffinityConstraint:
+      type: object
+      properties:
+        worker_id: { type: string }
+        worker_tags: { type: object, additionalProperties: { type: string } }
+        activity_types: { type: array, items: { type: string } }
+    AffinityRules:
+      type: object
+      properties:
+        hard_affinity: { $ref: '#/components/schemas/AffinityConstraint' }
+        soft_affinity: { $ref: '#/components/schemas/AffinityConstraint' }
+        anti_affinity: { $ref: '#/components/schemas/AffinityConstraint' }
+    ActivitySubmitRequest:
+      type: object
+      required: [activity_type, input_json]
+      properties:
+        activity_type: { type: string }
+        input_json:
+          type: object
+          additionalProperties: true
+          description: Opaque to the engine; meaningful only to the activity's app.
+        priority: { type: integer, default: 10 }
+        affinity_rules: { $ref: '#/components/schemas/AffinityRules' }
+        retry_policy: { $ref: '#/components/schemas/RetryPolicy' }
+    ActivitySubmitResponse:
+      type: object
+      properties:
+        activity_id: { type: string }
+        status: { $ref: '#/components/schemas/ActivityStatus' }
+        created_at: { type: string, format: date-time }
+        estimated_start_time: { type: string, format: date-time }
+    Activity:
+      type: object
+      properties:
+        activity_id: { type: string }
+        customer_id: { type: string }
+        activity_type: { type: string }
+        parent_activity_id: { type: [string, 'null'] }
+        root_activity_id: { type: [string, 'null'] }
+        status: { $ref: '#/components/schemas/ActivityStatus' }
+        suspend_reason: { type: [string, 'null'], enum: [run_child, sleep, await_signal, null] }
+        wake_at: { type: [string, 'null'], format: date-time }
+        priority: { type: integer }
+        worker_id: { type: [string, 'null'] }
+        input_json: { type: object, additionalProperties: true }
+        result_json: { type: [object, 'null'], additionalProperties: true }
+        error_json: { type: [object, 'null'], additionalProperties: true }
+        current_attempt: { type: integer }
+        generation: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+        started_at: { type: [string, 'null'], format: date-time }
+        completed_at: { type: [string, 'null'], format: date-time }
+    ActivityAttempt:
+      type: object
+      properties:
+        attempt_number: { type: integer }
+        worker_id: { type: [string, 'null'] }
+        generation: { type: integer, format: int64 }
+        status: { $ref: '#/components/schemas/ActivityStatus' }
+        error: { type: [object, 'null'], additionalProperties: true }
+        started_at: { type: string, format: date-time }
+        ended_at: { type: [string, 'null'], format: date-time }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, enum: [INVALID_INPUT, INVALID_STATE, UNAUTHORIZED, FORBIDDEN, NOT_FOUND, CONFLICT, RATE_LIMITED, SERVICE_UNAVAILABLE, INTERNAL_ERROR] }
+            message: { type: string }
+            details: { type: object, additionalProperties: true }
+            request_id: { type: string }

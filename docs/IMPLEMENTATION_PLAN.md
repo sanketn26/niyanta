@@ -3,7 +3,7 @@
 **Version**: 2.2
 **Last Updated**: 2026-05-03
 **Status**: Planning Phase
-**Supersedes**: v1.0 (workload-based model). Reframed around the activity execution model defined in [ADR-005](adr/ADR-005-activity-execution-model.md).
+**Supersedes**: v1.0 (workload-based model). Reframed around the activity execution model defined in [ADR-005](platform/adr/ADR-005-activity-execution-model.md).
 
 ## Table of Contents
 1. [Executive Summary](#executive-summary)
@@ -30,7 +30,7 @@
 
 ## Executive Summary
 
-This document outlines a phased approach to implementing Niyanta as a self-orchestrated ingestion platform backed by a distributed activity execution system. The plan is structured to deliver incremental value while managing technical risk, and is reframed around the activity model defined in [ADR-005](adr/ADR-005-activity-execution-model.md). The ingestion control-plane shape is defined in [INGESTION_ARCHITECTURE.md](INGESTION_ARCHITECTURE.md).
+This document outlines a phased approach to implementing Niyanta as a self-orchestrated ingestion platform backed by a distributed activity execution system. The plan is structured to deliver incremental value while managing technical risk, and is reframed around the activity model defined in [ADR-005](platform/adr/ADR-005-activity-execution-model.md). The ingestion control-plane shape is defined in [INGESTION_ARCHITECTURE.md](apps/dataconnector/INGESTION_ARCHITECTURE.md).
 
 ### Key Objectives
 
@@ -80,7 +80,7 @@ The phases are designed so that **each one ends with a runnable system**. If you
 
 ### Guiding principles
 
-1. **Interfaces from day one.** Every storage and broker concern lives behind an interface starting in Phase 0. Phase 1's Postgres impl can be swapped for Phase 6's JetStream impl without touching activity code. Six storage interfaces (`ActivityStore`, `AttemptStore`, `HeartbeatStore`, `ActivityCallStore`, `WorkerRegistry`, `LeaderElector`), one queue (`TaskQueue`), one signal bus (`SignalBus`), one event bus (`EventBus`). See [ADR-005](adr/ADR-005-activity-execution-model.md).
+1. **Interfaces from day one.** Every storage and broker concern lives behind an interface starting in Phase 0. Phase 1's Postgres impl can be swapped for Phase 6's JetStream impl without touching activity code. Six storage interfaces (`ActivityStore`, `AttemptStore`, `HeartbeatStore`, `ActivityCallStore`, `WorkerRegistry`, `LeaderElector`), one queue (`TaskQueue`), one signal bus (`SignalBus`), one event bus (`EventBus`). See [ADR-005](platform/adr/ADR-005-activity-execution-model.md).
 2. **In-memory before external.** Phase 0 ships an in-memory implementation of every interface. End-to-end runs before any external dependency is introduced; design problems surface before infrastructure problems can hide them.
 3. **Vertical slices.** Don't build "all of storage" then "all of scheduler." Build one activity end-to-end (submit → schedule → execute → complete), then add features to that slice phase by phase.
 4. **Test what's invisible.** Replay, retry, and resume are invisible when they work. Failing tests come first: kill a worker mid-activity, drop a signal, time out a heartbeat. Make them pass.
@@ -94,7 +94,7 @@ The phases are designed so that **each one ends with a runnable system**. If you
 **Duration**: 1 week (solo)
 
 **Key Deliverables**:
-- Project skeleton per [impl/PHASE_0_SKELETON.md](impl/PHASE_0_SKELETON.md). Makefile (`build`, `test`, `lint`, `run`). golangci-lint config.
+- Project skeleton per [impl/PHASE_0_SKELETON.md](platform/impl/PHASE_0_SKELETON.md). Makefile (`build`, `test`, `lint`, `run`). golangci-lint config.
 - Domain models in `pkg/models/` — `Activity` (renamed from `Workload`), `ActivityAttempt`, `ActivityCall` (placeholder, populated in Phase 3), `Worker`, `Customer`, status enums.
 - `Activity` interface and `ActivityContext` in `pkg/activity/` with all methods declared from day one. `RunChild`, `Sleep`, `Now`, `NewID`, `AwaitSignal` stub-return `ErrNotImplemented` until their phases.
 - All eight storage/queue/bus interfaces declared in `internal/storage/`, `internal/broker/`, `internal/signal/`.
@@ -120,7 +120,7 @@ The phases are designed so that **each one ends with a runnable system**. If you
 
 **Key Deliverables**:
 - Postgres implementations of `ActivityStore`, `AttemptStore`, `HeartbeatStore` in `internal/storage/postgres/`. `pgx/v5` directly, no ORM. Connection pool config in `internal/config/`.
-- Migrations via `golang-migrate`. Initial migration: `activities`, `activity_attempts`, `activity_heartbeats`, `workers`. Schema starts simpler than [DATA_MODELS.md](DATA_MODELS.md) — only what Phase 1 uses; later phases extend.
+- Migrations via `golang-migrate`. Initial migration: `activities`, `activity_attempts`, `activity_heartbeats`, `workers`. Schema starts simpler than [DATA_MODELS.md](platform/DATA_MODELS.md) — only what Phase 1 uses; later phases extend.
 - Postgres-polling `TaskQueue`. Pending attempts queried with `SELECT … FOR UPDATE SKIP LOCKED LIMIT 1` every 2s. Crude but adequate.
 - `RetryPolicy` declared per registered activity type: `MaxAttempts`, `InitialInterval`, `BackoffCoefficient`, `MaxInterval`, `NonRetryableErrors`. Framework enforces — activity code never retries itself.
 - Typed errors: `RetryableError`, `NonRetryableError`, classification helpers.
@@ -145,12 +145,12 @@ The phases are designed so that **each one ends with a runnable system**. If you
 
 **Key Deliverables**:
 - Split binaries: `cmd/coordinator/`, `cmd/worker/`. Shared code in `internal/`.
-- NATS-backed `EventBus` in `internal/broker/nats/`. Channels per [ARCHITECTURE.md:280](ARCHITECTURE.md#L280): `worker.{id}.commands`, `worker.{id}.status`, `coordinator.events`. Reconnect logic, pub-with-retry.
+- NATS-backed `EventBus` in `internal/broker/nats/`. Channels per [ARCHITECTURE.md:280](platform/ARCHITECTURE.md#L280): `worker.{id}.commands`, `worker.{id}.status`, `coordinator.events`. Reconnect logic, pub-with-retry.
 - Worker process: registers on startup, subscribes to its command channel, heartbeats every 30s with capacity + running-activity inventory.
 - Coordinator process: HTTP API for `submit/get/list/cancel` (minimal, no auth yet); scheduler loop every 5s; health monitor loop every 30s.
 - Worker failure detection: marks workers `DEAD` after 60s without heartbeat; `INTERRUPTED` their in-flight attempts; re-enqueues.
 - Lease + fence tokens: `lease_expires_at` on the attempt; `generation` on the activity; workers reject commands with stale generation. Resolves split-brain.
-- Affinity (hard, soft, anti-affinity) — moved here from v1 Phase 1 because affinity is meaningless with one worker. Implementation lives in `internal/scheduler/affinity.go` per [impl/PHASE_2_DISTRIBUTED_WORKERS.md](impl/PHASE_2_DISTRIBUTED_WORKERS.md). Soft affinity is scoring; hard is filter; anti-affinity needs `GetActivitiesByWorker` query.
+- Affinity (hard, soft, anti-affinity) — moved here from v1 Phase 1 because affinity is meaningless with one worker. Implementation lives in `internal/scheduler/affinity.go` per [impl/PHASE_2_DISTRIBUTED_WORKERS.md](platform/impl/PHASE_2_DISTRIBUTED_WORKERS.md). Soft affinity is scoring; hard is filter; anti-affinity needs `GetActivitiesByWorker` query.
 - docker-compose for local dev: postgres + nats + 1 coordinator + 2 workers.
 
 **Success Criteria**:
@@ -179,7 +179,7 @@ The phases are designed so that **each one ends with a runnable system**. If you
 - Call-index determinism: sequential `nextCallIndex()` counter per attempt. Runtime check on replay: if a logged call's type doesn't match the activity's call at the same index, fail loudly with a determinism-violation error.
 - Locality default: always remote (always dispatched via `TaskQueue`). In-process optimization deferred to a later phase.
 - Sample composite activities: `sequential_pipeline` (3 children combined), `flaky_pipeline` (children fail randomly, parent retries each via the resume mechanism).
-- Document the call-log + replay semantics fully in [impl/PHASE_3_CHILD_ACTIVITIES_REPLAY.md](impl/PHASE_3_CHILD_ACTIVITIES_REPLAY.md) before writing code — replay correctness is subtle.
+- Document the call-log + replay semantics fully in [impl/PHASE_3_CHILD_ACTIVITIES_REPLAY.md](platform/impl/PHASE_3_CHILD_ACTIVITIES_REPLAY.md) before writing code — replay correctness is subtle.
 
 **Success Criteria**:
 - Submit `sequential_pipeline` with 3 children. `psql` timeline shows: parent attempt 1 dispatches child 0 → suspends; child 0 completes; parent attempt 2 replays past child 0 (instant), dispatches child 1 → suspends; ... ; parent attempt 4 replays past all three, returns the combined result.
@@ -212,7 +212,7 @@ The phases are designed so that **each one ends with a runnable system**. If you
 - `ctx.AwaitSignal(name, timeout)` — same suspend-and-resume pattern as `RunChild`. Records `_await_signal(name, timeout)` in call log. Coordinator parks the parent until signal arrives or timeout fires.
 - Signal addressing: external clients send via API `POST /v1/activities/{id}/signals/{name}`. Activities can also send via `ctx.SendSignal(target_id, name, payload)`.
 - Sample agentic-monitor activity: `for { ctx.AwaitSignal("alert", 24*time.Hour); ctx.RunChild("evaluate_and_decide", ...); }`. Demonstrates multi-day lifetime.
-- [impl/PHASE_4_TIMERS_SIGNALS.md](impl/PHASE_4_TIMERS_SIGNALS.md) written before code — delivery semantics, mailbox storage, race handling.
+- [impl/PHASE_4_TIMERS_SIGNALS.md](platform/impl/PHASE_4_TIMERS_SIGNALS.md) written before code — delivery semantics, mailbox storage, race handling.
 
 **Success Criteria**:
 - Submit a monitor activity. Don't touch it for hours. Send a signal. Activity wakes, runs a child, suspends again. Kill all workers. Restart. Send another signal. Wakes correctly.
@@ -235,25 +235,25 @@ The phases are designed so that **each one ends with a runnable system**. If you
 **Duration**: 3 weeks (solo)
 
 **Key Deliverables**:
-- Connector definition and connection APIs per [DATA_CONNECTOR_SPEC.md](DATA_CONNECTOR_SPEC.md): create/list/get/update/test/run/pause/resume.
+- Connector definition and connection APIs per [DATA_CONNECTOR_SPEC.md](apps/dataconnector/DATA_CONNECTOR_SPEC.md): create/list/get/update/test/run/pause/resume.
 - Connector registry and connection manager tables: definitions, versions, direction, packaging metadata, compatibility metadata, customer connections, secret refs, destinations, selected catalog, health state.
 - Connector discovery/catalog foundation: `GetSpec`, `Discover`, selected-catalog storage, catalog versioning, and run references to a selected catalog version.
 - Isolation policy model: shared, pooled, and dedicated worker placement; tenant-scoped state, secret refs, destination refs, checkpoints, dedupe state, logs, metrics, and traces.
 - Customer ingestion operations: CID-scoped ingestion view, significant event filters, active connection controls, rate-limit overrides, and temporary disable controls for erring connections.
-- Operational failure semantics from [OPERATIONS_AND_FAILURE_SEMANTICS.md](OPERATIONS_AND_FAILURE_SEMANTICS.md): at-least-once delivery, checkpoint-after-confirmed-ingestion, dead-letter sinks, connector spec versioning, secret-rotation wakeups, backfill isolation, and blast-radius controls.
-- Ingestion planner loop from [INGESTION_ARCHITECTURE.md](INGESTION_ARCHITECTURE.md): schedules, lag, checkpoint state, backfills, source rate limits, destination backpressure, and health policy produce `ConnectorRun` records and activity attempts.
+- Operational failure semantics from [OPERATIONS_AND_FAILURE_SEMANTICS.md](apps/dataconnector/OPERATIONS_AND_FAILURE_SEMANTICS.md): at-least-once delivery, checkpoint-after-confirmed-ingestion, dead-letter sinks, connector spec versioning, secret-rotation wakeups, backfill isolation, and blast-radius controls.
+- Ingestion planner loop from [INGESTION_ARCHITECTURE.md](apps/dataconnector/INGESTION_ARCHITECTURE.md): schedules, lag, checkpoint state, backfills, source rate limits, destination backpressure, and health policy produce `ConnectorRun` records and activity attempts.
 - Initial declarative `poll_http` runtime: API key/basic/OAuth2 client credentials, JSON response extraction, time-window checkpoints, batching, and at-least-once delivery.
 - Native `poll_http` implements `GetSpec`, `Test`, `Discover`, and `Run`; Airbyte-compatible command execution is represented in the model but not executed in Phase 5.
 - Connection supervisor semantics using `ctx.Sleep` and `ctx.AwaitSignal`: config changes, backfills, and manual run requests wake the supervisor.
-- Full REST API per [API_SPEC.md](API_SPEC.md), with `workloads` renamed to `activities` throughout. Activity submit/get/list/cancel/pause/resume; logs; audit trail; customer info; usage stats; health/ready/metrics endpoints.
-- API key authentication per [API_SPEC.md:33-50](API_SPEC.md#L33-L50). Hashed in DB. Customer extraction middleware. All queries filter by `customer_id`.
+- Full REST API per [API_SPEC.md](platform/API_SPEC.md), with `workloads` renamed to `activities` throughout. Activity submit/get/list/cancel/pause/resume; logs; audit trail; customer info; usage stats; health/ready/metrics endpoints.
+- API key authentication per [API_SPEC.md:33-50](platform/API_SPEC.md#L33-L50). Hashed in DB. Customer extraction middleware. All queries filter by `customer_id`.
 - Backpressure: queue-depth check on submit; 503 with `Retry-After` when at customer's queue limit.
-- Rate limiting: token bucket per customer, tier-based limits per [DATA_MODELS.md:120-126](DATA_MODELS.md#L120-L126).
+- Rate limiting: token bucket per customer, tier-based limits per [DATA_MODELS.md:120-126](platform/DATA_MODELS.md#L120-L126).
 - Priority scheduler with SLA tier weights (Free=1, Standard=10, Premium=50, Enterprise=100) and aging to prevent starvation (boost +5 priority per minute of wait). Moved here from v1 Phase 2 because tiers are meaningless without multi-tenant.
 - Structured logging (zap or zerolog) with correlation IDs across connection → run → activity → attempt → call.
-- Prometheus metrics from [ARCHITECTURE.md](ARCHITECTURE.md). Per-customer, per-connector, per-connection, per-activity-type counters/histograms. Queue depth, source lag, checkpoint age, destination latency, and worker utilization gauges (sets up Phase 6 auto-scaling).
+- Prometheus metrics from [ARCHITECTURE.md](platform/ARCHITECTURE.md). Per-customer, per-connector, per-connection, per-activity-type counters/histograms. Queue depth, source lag, checkpoint age, destination latency, and worker utilization gauges (sets up Phase 6 auto-scaling).
 - OpenTelemetry tracing. Span per connector supervisor, planner cycle, activity, attempt, source read, transform, destination flush, checkpoint commit, and `RunChild`. Trace context propagation through `ActivityContext`.
-- Audit events table per [DATA_MODELS.md:357-372](DATA_MODELS.md#L357-L372). Async writer (channel + worker goroutine) so audit doesn't block hot path.
+- Audit events table per [DATA_MODELS.md:357-372](platform/DATA_MODELS.md#L357-L372). Async writer (channel + worker goroutine) so audit doesn't block hot path.
 
 **Success Criteria**:
 - Create a `poll_http` connector definition and customer connection. The planner creates runs without manual workload submission.
@@ -328,19 +328,19 @@ The phases are designed so that **each one ends with a runnable system**. If you
 
 ### Phase 6: HA, scale, hardening
 
-**Goal**: Coordinator HA, NATS JetStream `SignalBus`, auto-scaling, determinism linter, chaos testing, scale to the targets in [ARCHITECTURE.md:693-702](ARCHITECTURE.md#L693-L702).
+**Goal**: Coordinator HA, NATS JetStream `SignalBus`, auto-scaling, determinism linter, chaos testing, scale to the targets in [ARCHITECTURE.md:693-702](platform/ARCHITECTURE.md#L693-L702).
 
 **Duration**: open-ended; tackle items selectively based on actual scale needs.
 
 **Key Deliverables**:
-- Coordinator HA via `LeaderElector`. Pick one mechanism (Postgres advisory lock *or* etcd) and align architecture/data-model docs with [impl/PHASE_6_HA_SCALE_HARDENING.md](impl/PHASE_6_HA_SCALE_HARDENING.md). Followers serve API; leader runs scheduler, health monitor, timer wheel, signal listener. Generation tokens prevent split-brain.
+- Coordinator HA via `LeaderElector`. Pick one mechanism (Postgres advisory lock *or* etcd) and align architecture/data-model docs with [impl/PHASE_6_HA_SCALE_HARDENING.md](apps/dataconnector/impl/PHASE_6_HA_SCALE_HARDENING.md). Followers serve API; leader runs scheduler, health monitor, timer wheel, signal listener. Generation tokens prevent split-brain.
 - NATS JetStream-backed `SignalBus` impl as alternative behind the same interface. Removes the LISTEN/NOTIFY single-coordinator bottleneck — required for true HA.
-- Auto-scaling: custom Prometheus metrics adapter, Kubernetes HPA manifests, queue-depth- and utilization-based scaling per [impl/PHASE_6_HA_SCALE_HARDENING.md](impl/PHASE_6_HA_SCALE_HARDENING.md).
+- Auto-scaling: custom Prometheus metrics adapter, Kubernetes HPA manifests, queue-depth- and utilization-based scaling per [impl/PHASE_6_HA_SCALE_HARDENING.md](apps/dataconnector/impl/PHASE_6_HA_SCALE_HARDENING.md).
 - Determinism linter: static analysis catching direct use of `time.Now()`, `rand.*`, file/network I/O in any package whose activities call `RunChild` (or other suspend points). Run in CI.
 - Chaos testing: random worker kills, leader kills, NATS message drops, brief Postgres pauses. Verify SLOs hold — no lost activities, bounded retry duplication, exactly-once-per-instance signal delivery.
 - Performance work: load test to architecture targets (10K concurrent activities, p95 latency, etc.). Profile and fix hot spots. Database indexes per actual query patterns.
 - Heartbeat S3 offload via a `BlobStore` interface — for activities with large heartbeat payloads (> threshold), payload goes to S3 with pointer in `activity_heartbeats`. Resolves the Postgres-bytea concern from architectural review.
-- Database read replicas for query offloading at scale (> 5K concurrent activities). Read/write splitting belongs in [impl/PHASE_6_HA_SCALE_HARDENING.md](impl/PHASE_6_HA_SCALE_HARDENING.md) — `GetPendingActivities`, list endpoints, `GetActivity` go to replica; writes go to primary.
+- Database read replicas for query offloading at scale (> 5K concurrent activities). Read/write splitting belongs in [impl/PHASE_6_HA_SCALE_HARDENING.md](apps/dataconnector/impl/PHASE_6_HA_SCALE_HARDENING.md) — `GetPendingActivities`, list endpoints, `GetActivity` go to replica; writes go to primary.
 
 **Success Criteria**:
 - Kill the leader coordinator: failover within 30s, no activity progress lost, no duplicate execution.
@@ -470,7 +470,7 @@ Each phase has its own success criteria embedded in the §[Development Phases](#
 - Sustained 1000 activities/min for 24h with no errors.
 - HPA scales workers up under load, down when idle.
 - Determinism lint catches deliberately-broken activity in CI.
-- Architecture targets from [ARCHITECTURE.md:693-702](ARCHITECTURE.md#L693-L702) met under load test.
+- Architecture targets from [ARCHITECTURE.md:693-702](platform/ARCHITECTURE.md#L693-L702) met under load test.
 
 ---
 
@@ -561,10 +561,10 @@ Items not on the critical path for the stated use cases. Pick up as needed.
 
 ## References
 
-- [ADR-005](adr/ADR-005-activity-execution-model.md) — Activity execution model (the basis for this plan's reframing)
-- [ARCHITECTURE.md](ARCHITECTURE.md) — System architecture (note: `Workload` references throughout will be renamed to `Activity` after Phase 3 lands)
-- [DATA_MODELS.md](DATA_MODELS.md) — Schema (will be extended in Phase 1, 3, and 4 — see each phase's Key Deliverables)
-- [API_SPEC.md](API_SPEC.md) — API contracts (full surface lands in Phase 5)
+- [ADR-005](platform/adr/ADR-005-activity-execution-model.md) — Activity execution model (the basis for this plan's reframing)
+- [ARCHITECTURE.md](platform/ARCHITECTURE.md) — System architecture (note: `Workload` references throughout will be renamed to `Activity` after Phase 3 lands)
+- [DATA_MODELS.md](platform/DATA_MODELS.md) — Schema (will be extended in Phase 1, 3, and 4 — see each phase's Key Deliverables)
+- [API_SPEC.md](platform/API_SPEC.md) — API contracts (full surface lands in Phase 5)
 - [CLAUDE.md](../CLAUDE.md) — Project overview and Go conventions
 
 ---
@@ -574,7 +574,7 @@ Items not on the critical path for the stated use cases. Pick up as needed.
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2025-10-27 | Initial implementation plan (workload-based model, multi-engineer phasing). |
-| 2.0 | 2026-04-28 | Reframed around the activity execution model from [ADR-005](adr/ADR-005-activity-execution-model.md). Replaced workload + manual checkpoint with activity + framework-managed retries + replay-based resume. Signals promoted from Phase 3 to Phase 4 (now mandatory for stated use cases). Affinity moved from Phase 1 to Phase 2 (meaningless without multi-worker). Priority moved from Phase 2 to Phase 5 (meaningless without multi-tenant). Phasing rescaled for solo execution; old multi-engineer phasing preserved in §Resource Requirements. Removed redundant per-task work-item lists — phase narratives are the source of truth. |
+| 2.0 | 2026-04-28 | Reframed around the activity execution model from [ADR-005](platform/adr/ADR-005-activity-execution-model.md). Replaced workload + manual checkpoint with activity + framework-managed retries + replay-based resume. Signals promoted from Phase 3 to Phase 4 (now mandatory for stated use cases). Affinity moved from Phase 1 to Phase 2 (meaningless without multi-worker). Priority moved from Phase 2 to Phase 5 (meaningless without multi-tenant). Phasing rescaled for solo execution; old multi-engineer phasing preserved in §Resource Requirements. Removed redundant per-task work-item lists — phase narratives are the source of truth. |
 | 2.1 | 2026-05-01 | Recentered product framing around self-orchestrated ingestion: connector definitions/connections, ingestion planner, supervisor semantics, adaptive health, and ingestion observability. |
 | 2.2 | 2026-05-03 | Split connector ecosystem breadth out of Phase 5. Phase 5 now includes catalog/discovery foundations; Phase 5A covers packaging and Airbyte-compatible import metadata; Phase 5B covers database, CDC, destination connectors, and Airbyte image execution MVP. |
 

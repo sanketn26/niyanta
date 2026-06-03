@@ -1,8 +1,10 @@
-# Niyanta API Specification
+# Niyanta Platform API Specification
 
-**Version**: 1.1
-**Last Updated**: 2026-05-01
+**Version**: 2.0
+**Last Updated**: 2026-06-03
 **Status**: Design Phase
+
+> **v2.0 is the engine API.** This document covers only the **platform** surface — activities, workers, health, and cross-cutting concerns (auth, errors, rate limiting, pagination, versioning). App-specific APIs live with their apps: connector/connection/control/runbook endpoints are in [../apps/dataconnector/API_SPEC.md](../apps/dataconnector/API_SPEC.md) and [../apps/llmops/LLMOPS_SPEC.md](../apps/llmops/LLMOPS_SPEC.md). The v1 `workloads` surface is renamed to `activities` per [adr/ADR-005-activity-execution-model.md](adr/ADR-005-activity-execution-model.md).
 
 ## Table of Contents
 1. [Overview](#overview)
@@ -14,6 +16,8 @@
 7. [Pagination](#pagination)
 8. [WebSocket API (Optional)](#websocket-api-optional)
 9. [API Versioning](#api-versioning)
+10. [OpenAPI Specification](#openapi-specification)
+11. [SDK Examples](#sdk-examples)
 
 ---
 
@@ -21,10 +25,10 @@
 
 Niyanta exposes two API surfaces:
 
-1. **Coordinator REST/gRPC API**: For clients to manage ingestion, connector connections, and activities
-2. **Internal Broker Protocol**: For coordinator-worker communication (see [DATA_MODELS.md](DATA_MODELS.md))
+1. **Coordinator REST/gRPC API** — for clients to submit and manage **activities** and to administer workers and health. This is what apps build on; the activity is the only domain concept the engine exposes.
+2. **Internal Broker Protocol** — coordinator↔worker communication (see [DATA_MODELS.md](DATA_MODELS.md) §Broker Message Formats).
 
-This document focuses on the **Coordinator API** for external clients.
+This document focuses on the Coordinator API. Apps layer their own higher-level APIs (connector connections, ingestion views, findings, runbooks) on top; those are not engine concerns and are specified in the app docs.
 
 ---
 
@@ -32,37 +36,25 @@ This document focuses on the **Coordinator API** for external clients.
 
 ### API Key Authentication (Phase 1)
 
-**Request Header**:
 ```
 Authorization: Bearer <api_key>
 ```
 
-**API Key Format**:
-- Customer-specific: `nyt_<customer_id>_<random_32_chars>`
-- Example: `nyt_cust_abc123_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6`
+**API Key Format**: `nyt_<customer_id>_<random_32_chars>` — e.g. `nyt_cust_abc123_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6`
 
-**API Key Validation**:
-1. Extract customer_id from key prefix
-2. Verify key exists in database (table: `api_keys`)
-3. Check key expiration and status
-4. Inject `customer_id` into request context
+**Validation**:
+1. Extract `customer_id` from key prefix.
+2. Verify key exists (table: `api_keys`), check expiration/status.
+3. Inject `customer_id` into request context — **all** queries filter by it at the storage boundary.
 
 ### JWT Authentication (Phase 2)
 
-**Request Header**:
 ```
 Authorization: Bearer <jwt_token>
 ```
 
-**JWT Claims**:
 ```json
-{
-  "sub": "user_123",
-  "customer_id": "cust_abc123",
-  "tier": "premium",
-  "exp": 1735308896,
-  "iat": 1735305296
-}
+{ "sub": "user_123", "customer_id": "cust_abc123", "tier": "premium", "exp": 1735308896, "iat": 1735305296 }
 ```
 
 ---
@@ -71,853 +63,202 @@ Authorization: Bearer <jwt_token>
 
 **Base URL**: `https://api.niyanta.example.com/v1`
 
-### 0. Customer Ingestion Operations
+### 1. Activity Management
 
-These endpoints are the primary operator surface for a customer (`cid`). All responses are tenant-scoped. Callers must either authenticate as that customer or hold an internal support/admin permission for the requested `cid`.
+#### 1.1 Submit Activity
 
-#### 0.1 Get Customer Ingestion View
+**Endpoint**: `POST /activities`
 
-**Endpoint**: `GET /customers/{cid}/ingestion-view`
-
-**Description**: Return a customer-scoped ingestion dashboard view: connection health, active controls, significant events, lag, checkpoint age, and recent run metrics.
-
-**Query Parameters**:
-- `window` (optional): Metrics window, for example `15m`, `1h`, `24h` (default: `1h`)
-- `include_events` (optional): Include significant events (default: `true`)
-- `status` (optional): Filter connections by effective status
-
-**Response**: `200 OK`
-```json
-{
-  "customer_id": "cust_abc",
-  "summary": {
-    "connections_total": 42,
-    "connected": 35,
-    "degraded": 4,
-    "failing": 2,
-    "temporarily_disabled": 1,
-    "quarantined": 0
-  },
-  "connections": [
-    {
-      "connection_id": "conn_123",
-      "name": "prod-github-audit",
-      "connector_id": "github_audit",
-      "health": "degraded",
-      "effective_status": "rate_limited",
-      "source_lag_seconds": 900,
-      "checkpoint_age_seconds": 300,
-      "records_read": 12000,
-      "records_emitted": 11980,
-      "records_dropped": 20,
-      "active_controls": [
-        {
-          "control_id": "ctrl_123",
-          "control_type": "rate_limit_override",
-          "expires_at": "2026-05-01T18:00:00Z",
-          "reason": "source 429 spike"
-        }
-      ],
-      "latest_significant_event": {
-        "event_id": "evt_123",
-        "event_type": "source_rate_limited",
-        "severity": "warning",
-        "message": "Source returned repeated 429 responses",
-        "created_at": "2026-05-01T17:05:00Z"
-      }
-    }
-  ],
-  "significant_events": []
-}
-```
-
-#### 0.2 List Significant Ingestion Events
-
-**Endpoint**: `GET /customers/{cid}/ingestion-events`
-
-**Query Parameters**:
-- `significant` (optional): `true` or `false` (default: `true`)
-- `connection_id` (optional): Filter by connection
-- `event_type` (optional): Filter by event type
-- `severity` (optional): Filter by severity
-- `from` / `to` (optional): RFC3339 timestamps
-- `limit` (optional): Default `100`, max `500`
-
-#### 0.3 Create Significant Event Filter
-
-**Endpoint**: `POST /customers/{cid}/ingestion-event-filters`
-
-**Request Body**:
-```json
-{
-  "name": "Repeated source throttling",
-  "enabled": true,
-  "scope": {
-    "connector_id": "github_audit",
-    "connection_id": null
-  },
-  "match": {
-    "event_types": ["source_rate_limited"],
-    "severities": ["warning", "error"],
-    "min_count": 3,
-    "window_seconds": 300
-  },
-  "action": {
-    "mark_significant": true,
-    "alert": true
-  }
-}
-```
-
-**Response**: `201 Created`
-```json
-{
-  "filter_id": "flt_123",
-  "status": "enabled"
-}
-```
-
-#### 0.4 List Significant Event Filters
-
-**Endpoint**: `GET /customers/{cid}/ingestion-event-filters`
-
-**Response**: `200 OK`
-```json
-{
-  "filters": [
-    {
-      "filter_id": "flt_123",
-      "name": "Repeated source throttling",
-      "enabled": true,
-      "scope": {
-        "connector_id": "github_audit"
-      },
-      "match": {
-        "event_types": ["source_rate_limited"],
-        "severities": ["warning", "error"],
-        "min_count": 3,
-        "window_seconds": 300
-      },
-      "action": {
-        "mark_significant": true,
-        "alert": true
-      }
-    }
-  ]
-}
-```
-
-#### 0.5 Update Significant Event Filter
-
-**Endpoint**: `PATCH /customers/{cid}/ingestion-event-filters/{filter_id}`
-
-**Request Body**:
-```json
-{
-  "enabled": false
-}
-```
-
-**Response**: `200 OK`
-```json
-{
-  "filter_id": "flt_123",
-  "status": "disabled"
-}
-```
-
-#### 0.6 Apply Rate Limit To Erring Connection
-
-**Endpoint**: `POST /connector-connections/{connection_id}:rate-limit`
-
-**Description**: Apply a tenant-scoped temporary rate-limit override to an erring connection. The planner reads this before creating future runs.
-
-**Request Body**:
-```json
-{
-  "qps": 0.25,
-  "burst": 1,
-  "max_parallel_partitions": 1,
-  "duration_seconds": 3600,
-  "reason": "Repeated source 429 responses"
-}
-```
-
-**Response**: `202 Accepted`
-```json
-{
-  "control_id": "ctrl_123",
-  "connection_id": "conn_123",
-  "control_type": "rate_limit_override",
-  "expires_at": "2026-05-01T18:00:00Z"
-}
-```
-
-#### 0.7 Temporarily Disable Erring Connection
-
-**Endpoint**: `POST /connector-connections/{connection_id}:temporary-disable`
-
-**Description**: Stop planning new runs for a connection until `expires_at`. In-flight runs may complete unless separately cancelled.
-
-**Request Body**:
-```json
-{
-  "duration_seconds": 1800,
-  "reason": "Destination outage causing repeated delivery failures"
-}
-```
-
-**Response**: `202 Accepted`
-```json
-{
-  "control_id": "ctrl_456",
-  "connection_id": "conn_123",
-  "control_type": "temporary_disable",
-  "expires_at": "2026-05-01T17:30:00Z"
-}
-```
-
-#### 0.8 List Active Connection Controls
-
-**Endpoint**: `GET /connector-connections/{connection_id}/controls`
-
-**Response**: `200 OK`
-```json
-{
-  "connection_id": "conn_123",
-  "controls": [
-    {
-      "control_id": "ctrl_123",
-      "control_type": "rate_limit_override",
-      "config": {
-        "qps": 0.25,
-        "burst": 1,
-        "max_parallel_partitions": 1
-      },
-      "reason": "Repeated source 429 responses",
-      "expires_at": "2026-05-01T18:00:00Z"
-    }
-  ]
-}
-```
-
-#### 0.9 Clear Connection Control
-
-**Endpoint**: `POST /connector-connections/{connection_id}:clear-control`
-
-**Request Body**:
-```json
-{
-  "control_type": "rate_limit_override",
-  "reason": "Source recovered"
-}
-```
-
-**Response**: `200 OK`
-```json
-{
-  "connection_id": "conn_123",
-  "cleared": true
-}
-```
-
-### 1. Workload Management
-
-#### 1.1 Submit Workload
-
-**Endpoint**: `POST /workloads`
-
-**Description**: Submit a new workload for execution
+**Description**: Submit a new top-level activity for execution. (Child activities are created by a parent's `RunChild`, not via this endpoint.)
 
 **Request Headers**:
 ```
 Authorization: Bearer <api_key>
 Content-Type: application/json
-Idempotency-Key: <uuid> (optional)
+Idempotency-Key: <uuid>   (optional; see Idempotency)
 ```
 
 **Request Body**:
 ```json
 {
-  "workload_type": "video_transcoding",
-  "input_params": {
-    "video_url": "s3://input/video123.mp4",
-    "output_format": "mp4",
-    "resolution": "1080p"
-  },
+  "activity_type": "ingestion_supervisor",
+  "input_json": { "connection_id": "conn_123" },
   "priority": 10,
-  "affinity_rules": {
-    "hard_affinity": {
-      "worker_tags": {
-        "hardware": "gpu"
-      }
-    }
-  },
-  "timeout_seconds": 3600
+  "affinity_rules": { "hard_affinity": { "worker_tags": { "hardware": "gpu" } } },
+  "retry_policy": { "max_attempts": 3, "backoff": "exponential" }
 }
 ```
 
 **Request Schema**:
 ```go
-type WorkloadSubmitRequest struct {
-    WorkloadType    string                 `json:"workload_type" binding:"required"`
-    InputParams     map[string]interface{} `json:"input_params" binding:"required"`
-    Priority        int                    `json:"priority,omitempty"` // Default: 10
-    AffinityRules   *AffinityRules         `json:"affinity_rules,omitempty"`
-    TimeoutSeconds  int                    `json:"timeout_seconds,omitempty"`
+type ActivitySubmitRequest struct {
+    ActivityType  string                 `json:"activity_type" binding:"required"`
+    InputJSON     map[string]interface{} `json:"input_json" binding:"required"` // opaque to engine
+    Priority      int                    `json:"priority,omitempty"`             // default 10
+    AffinityRules *AffinityRules         `json:"affinity_rules,omitempty"`
+    RetryPolicy   *RetryPolicy           `json:"retry_policy,omitempty"`
 }
 ```
+
+> `activity_type` must be a type advertised by at least one worker (`400 INVALID_INPUT` otherwise). `input_json` is opaque — the engine never inspects it. Secrets must be passed as references, never inline.
 
 **Response**: `202 Accepted`
 ```json
-{
-  "workload_id": "wl_abc123",
-  "status": "PENDING",
-  "created_at": "2025-10-27T12:34:56Z",
-  "estimated_start_time": "2025-10-27T12:35:30Z"
-}
+{ "activity_id": "act_abc123", "status": "PENDING", "created_at": "2026-06-03T12:34:56Z", "estimated_start_time": "2026-06-03T12:35:30Z" }
 ```
 
-**Error Responses**:
-- `400 Bad Request`: Invalid input (e.g., unknown workload_type, invalid input_params)
-- `401 Unauthorized`: Invalid or missing API key
-- `429 Too Many Requests`: Rate limit exceeded
-- `503 Service Unavailable`: System at capacity (queue full)
+**Errors**: `400 INVALID_INPUT` (unknown activity_type / bad input), `401 UNAUTHORIZED`, `429 RATE_LIMITED`, `503 SERVICE_UNAVAILABLE` (queue full).
 
 ---
 
-#### 1.2 Get Workload Status
+#### 1.2 Get Activity
 
-**Endpoint**: `GET /workloads/{workload_id}`
-
-**Description**: Retrieve current status and details of a workload
-
-**Request Headers**:
-```
-Authorization: Bearer <api_key>
-```
+**Endpoint**: `GET /activities/{activity_id}`
 
 **Response**: `200 OK`
 ```json
 {
-  "workload_id": "wl_abc123",
+  "activity_id": "act_abc123",
   "customer_id": "cust_abc123",
-  "workload_type": "video_transcoding",
-  "status": "RUNNING",
+  "activity_type": "ingestion_supervisor",
+  "parent_activity_id": null,
+  "root_activity_id": "act_abc123",
+  "status": "SUSPENDED",
+  "suspend_reason": "sleep",
+  "wake_at": "2026-06-03T12:40:00Z",
   "priority": 10,
-  "progress_percent": 45,
-  "worker_id": "worker-5",
-  "input_params": {
-    "video_url": "s3://input/video123.mp4"
-  },
-  "result_data": null,
-  "error_message": null,
-  "retry_count": 0,
-  "created_at": "2025-10-27T12:34:56Z",
-  "scheduled_at": "2025-10-27T12:35:00Z",
-  "started_at": "2025-10-27T12:35:10Z",
-  "completed_at": null,
-  "estimated_completion_time": "2025-10-27T13:10:00Z"
+  "worker_id": null,
+  "input_json": { "connection_id": "conn_123" },
+  "result_json": null,
+  "error_json": null,
+  "current_attempt": 1,
+  "generation": 1,
+  "created_at": "2026-06-03T12:34:56Z",
+  "scheduled_at": "2026-06-03T12:35:00Z",
+  "started_at": "2026-06-03T12:35:10Z",
+  "completed_at": null
 }
 ```
 
-**Error Responses**:
-- `404 Not Found`: Workload does not exist or belongs to different customer
-- `401 Unauthorized`: Invalid API key
+**Errors**: `404 NOT_FOUND` (does not exist or belongs to another customer), `401 UNAUTHORIZED`.
 
 ---
 
-#### 1.3 List Workloads
+#### 1.3 List Activities
 
-**Endpoint**: `GET /workloads`
+**Endpoint**: `GET /activities`
 
-**Description**: List workloads for the authenticated customer with filtering and pagination
+**Query Parameters**: `status`, `activity_type`, `parent_activity_id`, `root_activity_id`, `limit` (default 50, max 100), `cursor` (preferred) or `offset`, `order_by` (default `created_at`), `order` (`asc`|`desc`).
 
-**Query Parameters**:
-- `status` (optional): Filter by status (e.g., `RUNNING`, `COMPLETED`)
-- `workload_type` (optional): Filter by workload type
-- `limit` (optional): Number of results per page (default: 50, max: 100)
-- `offset` (optional): Offset for pagination (default: 0)
-- `order_by` (optional): Sort field (default: `created_at`)
-- `order` (optional): Sort direction (`asc` or `desc`, default: `desc`)
-
-**Example Request**:
-```
-GET /workloads?status=RUNNING&limit=20&offset=0&order_by=priority&order=desc
-```
+**Example**: `GET /activities?status=RUNNING&activity_type=diagnose&limit=20&order_by=priority&order=desc`
 
 **Response**: `200 OK`
 ```json
-{
-  "workloads": [
-    {
-      "workload_id": "wl_abc123",
-      "workload_type": "video_transcoding",
-      "status": "RUNNING",
-      "priority": 50,
-      "progress_percent": 45,
-      "created_at": "2025-10-27T12:34:56Z",
-      "started_at": "2025-10-27T12:35:10Z"
-    },
-    {
-      "workload_id": "wl_def456",
-      "workload_type": "report_generation",
-      "status": "RUNNING",
-      "priority": 30,
-      "progress_percent": 80,
-      "created_at": "2025-10-27T11:20:00Z",
-      "started_at": "2025-10-27T11:21:00Z"
-    }
-  ],
-  "pagination": {
-    "total": 156,
-    "limit": 20,
-    "offset": 0,
-    "has_more": true
-  }
-}
+{ "activities": [ { "activity_id": "act_abc123", "status": "RUNNING", "...": "..." } ], "next_cursor": "eyJpZCI6..." }
 ```
 
 ---
 
-#### 1.4 Cancel Workload
+#### 1.4 Activity Lifecycle Operations
 
-**Endpoint**: `POST /workloads/{workload_id}/cancel`
+| Operation | Endpoint | Notes |
+|-----------|----------|-------|
+| Cancel | `POST /activities/{id}:cancel` | Cancels the activity and its in-flight children. Body: `{ "reason": "..." }`. |
+| Pause | `POST /activities/{id}:pause` | Pauses at the next safe suspend point. |
+| Resume | `POST /activities/{id}:resume` | Resumes a paused activity. |
+| Signal | `POST /activities/{id}:signal` | Deliver an external event. Body: `{ "name": "...", "payload": { } }`. Routes to the activity's mailbox. |
 
-**Description**: Cancel a pending or running workload
-
-**Request Headers**:
-```
-Authorization: Bearer <api_key>
-Content-Type: application/json
-```
-
-**Request Body** (optional):
-```json
-{
-  "reason": "User requested cancellation"
-}
-```
-
-**Response**: `200 OK`
-```json
-{
-  "workload_id": "wl_abc123",
-  "status": "CANCELLED",
-  "cancelled_at": "2025-10-27T12:45:00Z"
-}
-```
-
-**Error Responses**:
-- `400 Bad Request`: Workload already completed or cancelled
-- `404 Not Found`: Workload does not exist
+**Response**: `200 OK` with the updated activity, or `409 INVALID_STATE` if the transition is not allowed.
 
 ---
 
-#### 1.5 Pause Workload
+#### 1.5 Get Activity Attempts
 
-**Endpoint**: `POST /workloads/{workload_id}/pause`
+**Endpoint**: `GET /activities/{activity_id}/attempts`
 
-**Description**: Pause a running workload (creates checkpoint and stops execution)
+**Description**: The per-attempt audit trail (replaces the v1 `retry_count`). One row per physical attempt with worker, generation, error, and timing.
 
-**Request Headers**:
-```
-Authorization: Bearer <api_key>
-```
-
-**Response**: `200 OK`
 ```json
 {
-  "workload_id": "wl_abc123",
-  "status": "PAUSED",
-  "paused_at": "2025-10-27T12:50:00Z",
-  "checkpoint_sequence": 5
-}
-```
-
-**Error Responses**:
-- `400 Bad Request`: Workload not in RUNNING state
-- `404 Not Found`: Workload does not exist
-
----
-
-#### 1.6 Resume Workload
-
-**Endpoint**: `POST /workloads/{workload_id}/resume`
-
-**Description**: Resume a paused workload
-
-**Request Headers**:
-```
-Authorization: Bearer <api_key>
-```
-
-**Response**: `202 Accepted`
-```json
-{
-  "workload_id": "wl_abc123",
-  "status": "PENDING",
-  "checkpoint_sequence": 5
-}
-```
-
-**Error Responses**:
-- `400 Bad Request`: Workload not in PAUSED state
-
----
-
-#### 1.7 Get Workload Logs
-
-**Endpoint**: `GET /workloads/{workload_id}/logs`
-
-**Description**: Retrieve execution logs for a workload
-
-**Query Parameters**:
-- `limit` (optional): Number of log lines (default: 100, max: 1000)
-- `since` (optional): ISO 8601 timestamp to get logs after
-- `until` (optional): ISO 8601 timestamp to get logs before
-
-**Response**: `200 OK`
-```json
-{
-  "workload_id": "wl_abc123",
-  "logs": [
-    {
-      "timestamp": "2025-10-27T12:35:15Z",
-      "level": "INFO",
-      "message": "Starting video transcoding",
-      "details": {}
-    },
-    {
-      "timestamp": "2025-10-27T12:36:00Z",
-      "level": "INFO",
-      "message": "Processed 1000/10000 frames",
-      "details": {
-        "progress_percent": 10
-      }
-    }
-  ],
-  "has_more": false
-}
-```
-
----
-
-#### 1.8 Get Workload Audit Trail
-
-**Endpoint**: `GET /workloads/{workload_id}/audit`
-
-**Description**: Retrieve lifecycle events for a workload
-
-**Response**: `200 OK`
-```json
-{
-  "workload_id": "wl_abc123",
-  "events": [
-    {
-      "event_id": 1234,
-      "event_type": "workload.created",
-      "timestamp": "2025-10-27T12:34:56Z",
-      "actor_type": "user",
-      "actor_id": "user_789",
-      "details": {}
-    },
-    {
-      "event_id": 1235,
-      "event_type": "workload.scheduled",
-      "timestamp": "2025-10-27T12:35:00Z",
-      "actor_type": "coordinator",
-      "actor_id": "coordinator-1",
-      "details": {
-        "worker_id": "worker-5"
-      }
-    },
-    {
-      "event_id": 1236,
-      "event_type": "workload.started",
-      "timestamp": "2025-10-27T12:35:10Z",
-      "actor_type": "worker",
-      "actor_id": "worker-5",
-      "details": {}
-    }
+  "attempts": [
+    { "attempt_number": 1, "worker_id": "worker-3", "generation": 1, "status": "FAILED", "error": { "type": "transient", "message": "..." }, "started_at": "...", "ended_at": "..." },
+    { "attempt_number": 2, "worker_id": "worker-7", "generation": 2, "status": "RUNNING", "started_at": "..." }
   ]
 }
 ```
 
 ---
 
-### 2. Workload Configuration Management
+#### 1.6 Get Activity Logs
 
-#### 2.1 Create Workload Config
+**Endpoint**: `GET /activities/{activity_id}/logs`
 
-**Endpoint**: `POST /workload-configs`
+Streams or pages structured log lines for the activity and (optionally, `?include_children=true`) its composition tree. Standard pagination applies.
 
-**Description**: Register a new workload type configuration
+---
 
-**Request Body**:
+#### 1.7 Get Activity Audit Trail
+
+**Endpoint**: `GET /activities/{activity_id}/audit`
+
+Returns `audit_events` for the activity (created, scheduled, child_dispatched, suspended, resumed, signal_received, completed, redistributed, …).
+
+---
+
+### 2. Customer & Account
+
+#### 2.1 Get Customer Info
+
+**Endpoint**: `GET /customers/{customer_id}`
+
 ```json
-{
-  "workload_type": "video_transcoding",
-  "description": "Transcode videos to various formats",
-  "config_json": {
-    "default_codec": "h264",
-    "default_resolution": "1080p"
-  },
-  "resource_limits": {
-    "cpu_cores": 2,
-    "memory_mb": 2048,
-    "disk_mb": 10240
-  },
-  "checkpoint_interval_sec": 300,
-  "max_retries": 3,
-  "timeout_seconds": 7200
-}
+{ "customer_id": "cust_abc123", "name": "Acme", "tier": "premium", "limits": { "max_concurrent_activities": 500, "max_queue_depth": 2000, "rate_limit_per_sec": 50 } }
 ```
 
-**Response**: `201 Created`
+#### 2.2 Get Usage Statistics
+
+**Endpoint**: `GET /customers/{customer_id}/usage`
+
+**Query**: `window` (e.g. `1h`, `24h`, `30d`).
+
 ```json
-{
-  "config_id": "wlcfg_xyz789",
-  "workload_type": "video_transcoding",
-  "created_at": "2025-10-27T12:00:00Z"
-}
+{ "window": "24h", "activities_submitted": 1820, "activities_completed": 1790, "activities_failed": 30, "concurrent_peak": 240, "current_queue_depth": 12 }
 ```
 
 ---
 
-#### 2.2 List Workload Configs
+### 3. Worker Management (Admin Only)
 
-**Endpoint**: `GET /workload-configs`
+Requires an internal admin permission, not a customer key.
 
-**Description**: List all workload type configurations for the customer
+| Operation | Endpoint | Notes |
+|-----------|----------|-------|
+| List workers | `GET /workers` | Returns id, status, advertised `activity_types`, capacity, tags, last heartbeat. |
+| Drain worker | `POST /workers/{id}:drain` | Stops new assignments; finishes in-flight. |
+| Remove worker | `POST /workers/{id}:remove` | Marks DEAD; triggers redistribution of its activities. |
 
-**Response**: `200 OK`
 ```json
-{
-  "configs": [
-    {
-      "config_id": "wlcfg_xyz789",
-      "workload_type": "video_transcoding",
-      "description": "Transcode videos to various formats",
-      "resource_limits": {
-        "cpu_cores": 2,
-        "memory_mb": 2048
-      },
-      "created_at": "2025-10-27T12:00:00Z"
-    }
-  ]
-}
+// GET /workers
+{ "workers": [ { "id": "worker-5", "status": "HEALTHY", "activity_types": ["ingestion_supervisor", "diagnose"], "capacity_total": 10, "capacity_used": 3, "tags": { "region": "us-west-2" }, "last_heartbeat": "..." } ] }
 ```
 
 ---
 
-#### 2.3 Update Workload Config
+### 4. Health & Monitoring
 
-**Endpoint**: `PUT /workload-configs/{config_id}`
+| Endpoint | Purpose | Response |
+|----------|---------|----------|
+| `GET /health` | Liveness | `200 {"status":"ok"}` |
+| `GET /ready` | Readiness (DB + broker reachable, leader known) | `200`/`503` with dependency detail |
+| `GET /metrics` | Prometheus exposition | `text/plain` metrics |
 
-**Description**: Update an existing workload configuration (does not affect running workloads)
-
-**Request Body**: (same as create, all fields optional)
-
-**Response**: `200 OK`
-
----
-
-#### 2.4 Delete Workload Config
-
-**Endpoint**: `DELETE /workload-configs/{config_id}`
-
-**Description**: Delete a workload configuration (fails if workloads exist)
-
-**Response**: `204 No Content`
-
-**Error Responses**:
-- `409 Conflict`: Cannot delete config with associated workloads
-
----
-
-### 3. Customer & Account Management
-
-#### 3.1 Get Customer Info
-
-**Endpoint**: `GET /customer`
-
-**Description**: Retrieve authenticated customer's account information
-
-**Response**: `200 OK`
-```json
-{
-  "customer_id": "cust_abc123",
-  "name": "Acme Corp",
-  "tier": "premium",
-  "limits": {
-    "max_concurrent_workloads": 500,
-    "max_queue_depth": 2000,
-    "rate_limit_per_sec": 50
-  },
-  "usage": {
-    "current_running_workloads": 45,
-    "current_queue_depth": 12,
-    "workloads_today": 234
-  },
-  "created_at": "2024-01-15T09:00:00Z"
-}
 ```
-
----
-
-#### 3.2 Get Usage Statistics
-
-**Endpoint**: `GET /customer/stats`
-
-**Description**: Retrieve usage metrics and statistics
-
-**Query Parameters**:
-- `start_date` (required): ISO 8601 date
-- `end_date` (required): ISO 8601 date
-- `group_by` (optional): `day`, `hour`, `workload_type`
-
-**Response**: `200 OK`
-```json
-{
-  "start_date": "2025-10-01",
-  "end_date": "2025-10-27",
-  "summary": {
-    "total_workloads": 5432,
-    "completed_workloads": 5123,
-    "failed_workloads": 234,
-    "cancelled_workloads": 75,
-    "total_execution_hours": 1234.5
-  },
-  "by_workload_type": [
-    {
-      "workload_type": "video_transcoding",
-      "count": 3210,
-      "avg_duration_seconds": 1800,
-      "failure_rate": 0.05
-    },
-    {
-      "workload_type": "report_generation",
-      "count": 2222,
-      "avg_duration_seconds": 600,
-      "failure_rate": 0.02
-    }
-  ]
-}
-```
-
----
-
-### 4. Worker Management (Admin Only)
-
-#### 4.1 List Workers
-
-**Endpoint**: `GET /admin/workers`
-
-**Description**: List all registered workers (requires admin privileges)
-
-**Query Parameters**:
-- `status` (optional): Filter by status (HEALTHY, DRAINING, DEAD)
-
-**Response**: `200 OK`
-```json
-{
-  "workers": [
-    {
-      "worker_id": "worker-5",
-      "status": "HEALTHY",
-      "capabilities": ["video_transcoding", "image_processing"],
-      "capacity_total": 10,
-      "capacity_used": 3,
-      "tags": {
-        "region": "us-west-2",
-        "hardware": "gpu"
-      },
-      "last_heartbeat": "2025-10-27T12:55:30Z",
-      "running_workloads": ["wl_abc123", "wl_def456", "wl_ghi789"]
-    }
-  ]
-}
-```
-
----
-
-#### 4.2 Drain Worker
-
-**Endpoint**: `POST /admin/workers/{worker_id}/drain`
-
-**Description**: Mark worker as draining (no new workloads, finish current ones)
-
-**Response**: `200 OK`
-
----
-
-#### 4.3 Remove Worker
-
-**Endpoint**: `DELETE /admin/workers/{worker_id}`
-
-**Description**: Forcefully remove a worker (redistributes all workloads)
-
-**Response**: `204 No Content`
-
----
-
-### 5. Health & Monitoring
-
-#### 5.1 Health Check
-
-**Endpoint**: `GET /health`
-
-**Description**: Basic liveness check
-
-**Response**: `200 OK`
-```json
-{
-  "status": "healthy",
-  "timestamp": "2025-10-27T12:56:00Z"
-}
-```
-
----
-
-#### 5.2 Readiness Check
-
-**Endpoint**: `GET /ready`
-
-**Description**: Readiness for traffic (checks dependencies)
-
-**Response**: `200 OK` (if ready) or `503 Service Unavailable` (if not ready)
-```json
-{
-  "status": "ready",
-  "dependencies": {
-    "database": "connected",
-    "broker": "connected",
-    "leader_elected": true
-  }
-}
-```
-
----
-
-#### 5.3 Metrics
-
-**Endpoint**: `GET /metrics`
-
-**Description**: Prometheus-compatible metrics
-
-**Response**: `200 OK` (text/plain)
-```
-# HELP niyanta_workload_submissions_total Total number of workload submissions
-# TYPE niyanta_workload_submissions_total counter
-niyanta_workload_submissions_total{customer="cust_abc123",status="COMPLETED"} 1234
-niyanta_workload_submissions_total{customer="cust_abc123",status="FAILED"} 56
-
-# HELP niyanta_workload_duration_seconds Workload execution duration
-# TYPE niyanta_workload_duration_seconds histogram
-niyanta_workload_duration_seconds_bucket{customer="cust_abc123",workload_type="video_transcoding",le="60"} 100
-niyanta_workload_duration_seconds_bucket{customer="cust_abc123",workload_type="video_transcoding",le="300"} 500
-...
+# GET /metrics (excerpt)
+# HELP niyanta_activity_attempts_total Total activity attempts
+# TYPE niyanta_activity_attempts_total counter
+niyanta_activity_attempts_total{activity_type="diagnose",result="completed"} 1024
+# HELP niyanta_activity_duration_seconds Activity execution duration
+# TYPE niyanta_activity_duration_seconds histogram
 ```
 
 ---
@@ -926,7 +267,7 @@ niyanta_workload_duration_seconds_bucket{customer="cust_abc123",workload_type="v
 
 ### Service Definition (Protocol Buffers)
 
-**File**: `api/niyanta/v1/workload_service.proto`
+**File**: `api/niyanta/v1/activity_service.proto` (see [OpenAPI Specification](#openapi-specification) for artifact status).
 
 ```protobuf
 syntax = "proto3";
@@ -936,67 +277,61 @@ package niyanta.v1;
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/struct.proto";
 
-service WorkloadService {
-  rpc SubmitWorkload(SubmitWorkloadRequest) returns (SubmitWorkloadResponse);
-  rpc GetWorkload(GetWorkloadRequest) returns (GetWorkloadResponse);
-  rpc ListWorkloads(ListWorkloadsRequest) returns (ListWorkloadsResponse);
-  rpc CancelWorkload(CancelWorkloadRequest) returns (CancelWorkloadResponse);
-  rpc PauseWorkload(PauseWorkloadRequest) returns (PauseWorkloadResponse);
-  rpc ResumeWorkload(ResumeWorkloadRequest) returns (ResumeWorkloadResponse);
-  rpc StreamWorkloadStatus(StreamWorkloadStatusRequest) returns (stream WorkloadStatusUpdate);
+service ActivityService {
+  rpc SubmitActivity(SubmitActivityRequest) returns (SubmitActivityResponse);
+  rpc GetActivity(GetActivityRequest) returns (GetActivityResponse);
+  rpc ListActivities(ListActivitiesRequest) returns (ListActivitiesResponse);
+  rpc CancelActivity(CancelActivityRequest) returns (CancelActivityResponse);
+  rpc PauseActivity(PauseActivityRequest) returns (PauseActivityResponse);
+  rpc ResumeActivity(ResumeActivityRequest) returns (ResumeActivityResponse);
+  rpc SignalActivity(SignalActivityRequest) returns (SignalActivityResponse);
+  rpc StreamActivityStatus(StreamActivityStatusRequest) returns (stream ActivityStatusUpdate);
 }
 
-message SubmitWorkloadRequest {
-  string workload_type = 1;
-  google.protobuf.Struct input_params = 2;
+message SubmitActivityRequest {
+  string activity_type = 1;
+  google.protobuf.Struct input_json = 2;
   int32 priority = 3;
   AffinityRules affinity_rules = 4;
-  int32 timeout_seconds = 5;
+  RetryPolicy retry_policy = 5;
 }
 
-message SubmitWorkloadResponse {
-  string workload_id = 1;
-  WorkloadStatus status = 2;
+message SubmitActivityResponse {
+  string activity_id = 1;
+  ActivityStatus status = 2;
   google.protobuf.Timestamp created_at = 3;
-  google.protobuf.Timestamp estimated_start_time = 4;
 }
 
-message GetWorkloadRequest {
-  string workload_id = 1;
-}
-
-message GetWorkloadResponse {
-  Workload workload = 1;
-}
-
-message Workload {
-  string workload_id = 1;
+message Activity {
+  string activity_id = 1;
   string customer_id = 2;
-  string workload_type = 3;
-  WorkloadStatus status = 4;
-  int32 priority = 5;
-  int32 progress_percent = 6;
-  string worker_id = 7;
-  google.protobuf.Struct input_params = 8;
-  google.protobuf.Struct result_data = 9;
-  string error_message = 10;
-  int32 retry_count = 11;
-  google.protobuf.Timestamp created_at = 12;
-  google.protobuf.Timestamp scheduled_at = 13;
-  google.protobuf.Timestamp started_at = 14;
-  google.protobuf.Timestamp completed_at = 15;
+  string activity_type = 3;
+  string parent_activity_id = 4;
+  string root_activity_id = 5;
+  ActivityStatus status = 6;
+  int32 priority = 7;
+  string worker_id = 8;
+  google.protobuf.Struct input_json = 9;
+  google.protobuf.Struct result_json = 10;
+  google.protobuf.Struct error_json = 11;
+  int32 current_attempt = 12;
+  int64 generation = 13;
+  google.protobuf.Timestamp created_at = 14;
+  google.protobuf.Timestamp started_at = 15;
+  google.protobuf.Timestamp completed_at = 16;
 }
 
-enum WorkloadStatus {
-  WORKLOAD_STATUS_UNSPECIFIED = 0;
-  WORKLOAD_STATUS_PENDING = 1;
-  WORKLOAD_STATUS_SCHEDULED = 2;
-  WORKLOAD_STATUS_RUNNING = 3;
-  WORKLOAD_STATUS_PAUSED = 4;
-  WORKLOAD_STATUS_REDISTRIBUTING = 5;
-  WORKLOAD_STATUS_COMPLETED = 6;
-  WORKLOAD_STATUS_FAILED = 7;
-  WORKLOAD_STATUS_CANCELLED = 8;
+enum ActivityStatus {
+  ACTIVITY_STATUS_UNSPECIFIED = 0;
+  ACTIVITY_STATUS_PENDING = 1;
+  ACTIVITY_STATUS_SCHEDULED = 2;
+  ACTIVITY_STATUS_RUNNING = 3;
+  ACTIVITY_STATUS_SUSPENDED = 4;
+  ACTIVITY_STATUS_PAUSED = 5;
+  ACTIVITY_STATUS_REDISTRIBUTING = 6;
+  ACTIVITY_STATUS_COMPLETED = 7;
+  ACTIVITY_STATUS_FAILED = 8;
+  ACTIVITY_STATUS_CANCELLED = 9;
 }
 
 message AffinityRules {
@@ -1008,36 +343,39 @@ message AffinityRules {
 message AffinityConstraint {
   string worker_id = 1;
   map<string, string> worker_tags = 2;
-  repeated string workload_types = 3;
+  repeated string activity_types = 3;
 }
 
-// Streaming RPC for real-time status updates
-message StreamWorkloadStatusRequest {
-  string workload_id = 1;
+message RetryPolicy {
+  int32 max_attempts = 1;
+  string backoff = 2; // "exponential" | "linear" | "none"
 }
 
-message WorkloadStatusUpdate {
-  string workload_id = 1;
-  WorkloadStatus status = 2;
-  int32 progress_percent = 3;
-  google.protobuf.Timestamp timestamp = 4;
-  string message = 5;
+message SignalActivityRequest {
+  string activity_id = 1;
+  string name = 2;
+  google.protobuf.Struct payload = 3;
 }
 
-// Additional messages for List, Cancel, Pause, Resume...
+message StreamActivityStatusRequest { string activity_id = 1; }
+
+message ActivityStatusUpdate {
+  string activity_id = 1;
+  ActivityStatus status = 2;
+  google.protobuf.Timestamp timestamp = 3;
+  string message = 4;
+}
 ```
 
 ### gRPC Authentication
 
-**Metadata**:
 ```
 authorization: Bearer <api_key>
 ```
 
-**Example (Go Client)**:
 ```go
 ctx := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+apiKey)
-resp, err := client.SubmitWorkload(ctx, req)
+resp, err := client.SubmitActivity(ctx, req)
 ```
 
 ---
@@ -1046,288 +384,115 @@ resp, err := client.SubmitWorkload(ctx, req)
 
 ### Error Response Format
 
-**REST API**:
 ```json
 {
   "error": {
     "code": "INVALID_INPUT",
-    "message": "Workload type 'invalid_type' is not supported",
-    "details": {
-      "supported_types": ["video_transcoding", "report_generation"]
-    },
+    "message": "Activity type 'invalid_type' is not registered by any worker",
+    "details": { "known_types": ["ingestion_supervisor", "diagnose"] },
     "request_id": "req_abc123"
   }
 }
 ```
 
-**gRPC API**: Use standard gRPC status codes with details
+gRPC uses standard status codes with error details.
 
 ### Error Codes
 
-| HTTP Status | Error Code | Description |
-|-------------|------------|-------------|
+| HTTP | Code | Description |
+|------|------|-------------|
 | 400 | `INVALID_INPUT` | Request validation failed |
-| 400 | `INVALID_STATE` | Operation not allowed in current state |
-| 401 | `UNAUTHORIZED` | Invalid or missing authentication |
+| 409 | `INVALID_STATE` | Operation not allowed in current state |
+| 401 | `UNAUTHORIZED` | Invalid/missing authentication |
 | 403 | `FORBIDDEN` | Insufficient permissions |
-| 404 | `NOT_FOUND` | Resource does not exist |
-| 409 | `CONFLICT` | Resource conflict (e.g., duplicate) |
+| 404 | `NOT_FOUND` | Resource does not exist (or cross-tenant) |
+| 409 | `CONFLICT` | Resource conflict (e.g. idempotency replay mismatch) |
 | 429 | `RATE_LIMITED` | Rate limit exceeded |
-| 503 | `SERVICE_UNAVAILABLE` | System overloaded or dependency unavailable |
+| 503 | `SERVICE_UNAVAILABLE` | Overloaded or dependency unavailable |
 | 500 | `INTERNAL_ERROR` | Unexpected server error |
 
 ### Retry Guidelines
 
-**Retryable Errors** (with exponential backoff):
-- `503 Service Unavailable`
-- `429 Too Many Requests` (respect `Retry-After` header)
-- Network timeouts
+Retryable with exponential backoff: `503`, `429` (respect `Retry-After`), network timeouts. Non-retryable: `400`, `401`, `403`, `404`, `409 INVALID_STATE`.
 
-**Non-Retryable Errors**:
-- `400 Bad Request`
-- `401 Unauthorized`
-- `403 Forbidden`
-- `404 Not Found`
+### Idempotency
+
+`POST /activities` accepts an `Idempotency-Key` header (client UUID). The first request records the key → activity mapping (`idempotency_keys` table); a replay with the same key returns the original `activity_id` and `200`, or `409 CONFLICT` if the same key is reused with a different body.
 
 ---
 
 ## Rate Limiting
 
-### Rate Limit Headers
+### Headers (on every response)
 
-**Response Headers**:
 ```
 X-RateLimit-Limit: 50
-X-RateLimit-Remaining: 42
-X-RateLimit-Reset: 1735308900
+X-RateLimit-Remaining: 47
+X-RateLimit-Reset: 1735308896
 ```
 
-### Rate Limit Response
+### `429` Response
 
-**Status**: `429 Too Many Requests`
 ```json
-{
-  "error": {
-    "code": "RATE_LIMITED",
-    "message": "Rate limit exceeded. Retry after 30 seconds.",
-    "details": {
-      "limit": 50,
-      "window_seconds": 60,
-      "retry_after": 30
-    }
-  }
-}
+{ "error": { "code": "RATE_LIMITED", "message": "Rate limit exceeded", "details": { "retry_after_seconds": 2 } } }
 ```
 
-### Rate Limit Tiers
+### Tiers
 
-| Tier | Requests/Second | Burst |
-|------|-----------------|-------|
-| Free | 1 | 5 |
-| Standard | 10 | 50 |
-| Premium | 50 | 200 |
-| Enterprise | 200 | 1000 |
+Per-customer token bucket sized by tier (`free` 1/s … `enterprise` 200/s), as in [DATA_MODELS.md](DATA_MODELS.md) §Customers.
 
 ---
 
 ## Pagination
 
-### Cursor-Based Pagination (Preferred)
+### Cursor-Based (Preferred)
 
-**Request**:
 ```
-GET /workloads?limit=50&cursor=eyJpZCI6Ind...
+GET /activities?limit=50&cursor=eyJpZCI6ImFjdF8xMjMifQ
 ```
-
-**Response**:
 ```json
-{
-  "workloads": [...],
-  "pagination": {
-    "next_cursor": "eyJpZCI6Ind...",
-    "has_more": true
-  }
-}
+{ "activities": [ ], "next_cursor": "eyJpZCI6ImFjdF8xNzMifQ", "has_more": true }
 ```
+A null/absent `next_cursor` means the last page.
 
-### Offset-Based Pagination (Alternative)
+### Offset-Based (Alternative)
 
-**Request**:
 ```
-GET /workloads?limit=50&offset=100
+GET /activities?limit=50&offset=100
 ```
-
-**Response**:
 ```json
-{
-  "workloads": [...],
-  "pagination": {
-    "total": 500,
-    "limit": 50,
-    "offset": 100,
-    "has_more": true
-  }
-}
+{ "activities": [ ], "total": 1280, "limit": 50, "offset": 100 }
 ```
 
 ---
 
 ## WebSocket API (Optional)
 
-### Real-Time Workload Updates
+### Real-Time Activity Updates
 
-**Endpoint**: `wss://api.niyanta.example.com/v1/ws/workloads/{workload_id}`
-
-**Authentication**: Via query parameter or initial message
 ```
-wss://api.niyanta.example.com/v1/ws/workloads/wl_abc123?token=<api_key>
+wss://api.niyanta.example.com/v1/activities/{activity_id}/stream
+Authorization: Bearer <api_key>
 ```
-
-**Message Format** (JSON):
-```json
-{
-  "type": "status_update",
-  "workload_id": "wl_abc123",
-  "status": "RUNNING",
-  "progress_percent": 65,
-  "timestamp": "2025-10-27T13:05:00Z",
-  "message": "Processing frame 6500/10000"
-}
-```
-
-**Update Types**:
-- `status_update`: Status or progress changed
-- `log_line`: New log line available
-- `completed`: Workload finished (includes result_data)
-- `failed`: Workload failed (includes error_message)
+Server pushes `ActivityStatusUpdate` frames on status change, child dispatch, suspend/resume, and completion.
 
 ---
 
 ## API Versioning
 
-### URL Versioning
-
-**Format**: `/v{major}/...`
-
-**Example**:
-- v1: `/v1/workloads`
-- v2: `/v2/workloads` (future)
-
-### Deprecation Policy
-
-1. New version announced 6 months before old version deprecation
-2. Old version maintained for 12 months after new version release
-3. Deprecation warnings in response headers:
-   ```
-   Deprecation: Sun, 01 Jun 2025 00:00:00 GMT
-   Sunset: Sun, 01 Dec 2025 00:00:00 GMT
-   Link: <https://docs.niyanta.example.com/migration/v2>; rel="successor-version"
-   ```
-
----
-
-## Request/Response Examples
-
-### Example 1: Complete Workload Lifecycle
-
-**1. Submit Workload**:
-```bash
-curl -X POST https://api.niyanta.example.com/v1/workloads \
-  -H "Authorization: Bearer nyt_cust_abc123_..." \
-  -H "Content-Type: application/json" \
-  -d '{
-    "workload_type": "video_transcoding",
-    "input_params": {
-      "video_url": "s3://input/video123.mp4"
-    }
-  }'
-
-# Response:
-{
-  "workload_id": "wl_abc123",
-  "status": "PENDING",
-  "created_at": "2025-10-27T12:34:56Z"
-}
-```
-
-**2. Poll for Status**:
-```bash
-curl https://api.niyanta.example.com/v1/workloads/wl_abc123 \
-  -H "Authorization: Bearer nyt_cust_abc123_..."
-
-# Response:
-{
-  "workload_id": "wl_abc123",
-  "status": "RUNNING",
-  "progress_percent": 45,
-  "worker_id": "worker-5",
-  "started_at": "2025-10-27T12:35:10Z"
-}
-```
-
-**3. Wait for Completion** (or use WebSocket):
-```bash
-curl https://api.niyanta.example.com/v1/workloads/wl_abc123 \
-  -H "Authorization: Bearer nyt_cust_abc123_..."
-
-# Response:
-{
-  "workload_id": "wl_abc123",
-  "status": "COMPLETED",
-  "progress_percent": 100,
-  "result_data": {
-    "output_url": "s3://output/video123_transcoded.mp4"
-  },
-  "completed_at": "2025-10-27T13:00:00Z"
-}
-```
-
----
-
-### Example 2: Handle Failure with Retry
-
-**1. Submit Workload** (transient failure scenario):
-```bash
-# Same as Example 1
-```
-
-**2. Worker Fails**:
-```bash
-curl https://api.niyanta.example.com/v1/workloads/wl_abc123 \
-  -H "Authorization: Bearer nyt_cust_abc123_..."
-
-# Response:
-{
-  "workload_id": "wl_abc123",
-  "status": "REDISTRIBUTING",
-  "retry_count": 1,
-  "error_message": "Worker heartbeat timeout"
-}
-```
-
-**3. Automatic Redistribution**:
-```bash
-# After coordinator redistributes...
-curl https://api.niyanta.example.com/v1/workloads/wl_abc123 \
-  -H "Authorization: Bearer nyt_cust_abc123_..."
-
-# Response:
-{
-  "workload_id": "wl_abc123",
-  "status": "RUNNING",
-  "worker_id": "worker-7",
-  "retry_count": 1,
-  "progress_percent": 45  # Resumed from checkpoint
-}
-```
+- **URL versioning**: `/v1`, `/v2`. Breaking changes increment the major version.
+- **Deprecation policy**: a deprecated version is supported ≥ 6 months after its successor GA; `Deprecation` and `Sunset` response headers announce timelines.
 
 ---
 
 ## OpenAPI Specification
 
-Full OpenAPI 3.0 specification available at:
-- **File**: `api/openapi/niyanta-v1.yaml`
-- **Interactive Docs**: `https://api.niyanta.example.com/docs`
+The machine-readable contract for this engine API is maintained at:
+
+- **File**: [`api/openapi/niyanta-v1.yaml`](../../api/openapi/niyanta-v1.yaml)
+- **Status**: Partial stub covering the engine endpoints above (activities, workers, health). It is the source of truth for engine request/response shapes; app endpoints are documented in their app specs and are **not** in this file. The gRPC `.proto` lives at `api/niyanta/v1/activity_service.proto` (to be generated from the same source as the build matures).
+
+Regenerate SDKs/clients from the OpenAPI file; do not hand-edit generated clients.
 
 ---
 
@@ -1336,59 +501,39 @@ Full OpenAPI 3.0 specification available at:
 ### Go SDK
 
 ```go
-package main
+client := niyanta.NewClient(niyanta.Config{
+    BaseURL: "https://api.niyanta.example.com/v1",
+    APIKey:  apiKey,
+})
 
-import (
-    "context"
-    "github.com/yourusername/niyanta-go-sdk"
-)
+// Submit an activity
+resp, err := client.SubmitActivity(ctx, &niyanta.ActivitySubmitRequest{
+    ActivityType: "ingestion_supervisor",
+    InputJSON:    map[string]any{"connection_id": "conn_123"},
+})
 
-func main() {
-    client := niyanta.NewClient("nyt_cust_abc123_...")
-
-    // Submit workload
-    workload, err := client.Workloads.Submit(context.Background(), &niyanta.SubmitWorkloadRequest{
-        WorkloadType: "video_transcoding",
-        InputParams: map[string]interface{}{
-            "video_url": "s3://input/video123.mp4",
-        },
-    })
-    if err != nil {
-        panic(err)
-    }
-
-    // Wait for completion
-    finalWorkload, err := client.Workloads.WaitForCompletion(context.Background(), workload.ID)
-    if err != nil {
-        panic(err)
-    }
-
-    fmt.Println("Result:", finalWorkload.ResultData)
-}
+// Poll, or stream status
+act, err := client.GetActivity(ctx, resp.ActivityID)
 ```
 
 ### Python SDK
 
 ```python
-from niyanta import Client
+client = niyanta.Client(base_url="https://api.niyanta.example.com/v1", api_key=api_key)
 
-client = Client(api_key="nyt_cust_abc123_...")
-
-# Submit workload
-workload = client.workloads.submit(
-    workload_type="video_transcoding",
-    input_params={"video_url": "s3://input/video123.mp4"}
-)
-
-# Wait for completion
-final_workload = client.workloads.wait_for_completion(workload.id)
-print(f"Result: {final_workload.result_data}")
+resp = client.submit_activity(activity_type="ingestion_supervisor",
+                              input_json={"connection_id": "conn_123"})
+act = client.get_activity(resp.activity_id)
 ```
 
 ---
 
 ## References
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture overview
-- [DATA_MODELS.md](DATA_MODELS.md) - Data schemas and message formats
-- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) - Phased delivery plan
+- [adr/ADR-005-activity-execution-model.md](adr/ADR-005-activity-execution-model.md) - activity execution model
+- [ARCHITECTURE.md](ARCHITECTURE.md) - platform architecture overview
+- [DATA_MODELS.md](DATA_MODELS.md) - schemas and broker message formats
+- [../apps/dataconnector/API_SPEC.md](../apps/dataconnector/API_SPEC.md) - Data Connector app API
+- [../apps/llmops/LLMOPS_SPEC.md](../apps/llmops/LLMOPS_SPEC.md) - LLMOps app API
+- [../IMPLEMENTATION_PLAN.md](../IMPLEMENTATION_PLAN.md) - phased delivery plan
+```

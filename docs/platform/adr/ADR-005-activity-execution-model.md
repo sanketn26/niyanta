@@ -6,7 +6,7 @@
 
 ## Context
 
-Niyanta's original design defined a single `Workload` interface ([ARCHITECTURE.md:208-220](../ARCHITECTURE.md#L208-L220)) with `Init/Execute/Checkpoint/Close` methods. Workload code was responsible for its own checkpoint design, retry loops, and progress reporting.
+Niyanta's original (v1) design defined a single `Workload` interface with `Init/Execute/Checkpoint/Close` methods. Workload code was responsible for its own checkpoint design, retry loops, and progress reporting. This ADR supersedes that interface; the current `Activity` interface is documented in [ARCHITECTURE.md](../ARCHITECTURE.md) §Worker.
 
 The target use cases have since been clarified:
 
@@ -80,7 +80,7 @@ The signal delivery substrate is the most likely component to be swapped out as 
 - **Determinism tax on parent code.** New rule for activity authors to learn; subtle bugs (e.g., iterating a map) won't surface until the second resume. Mitigation: lint, plus integration tests that resume every activity at least once.
 - **Replay cost grows with call count, not wall time.** A parent that makes 10,000 `RunChild` calls in a single attempt will be slow to resume. Mitigation: practical activities make tens to hundreds of children, not thousands; if needed, intra-activity batching reduces call count.
 - **Signal delivery must be durable.** A signal arriving while no worker holds the parent must be persisted until the parent resumes. Adds a `signals` table (per-activity mailbox).
-- **Schema is larger than original `Workload` model.** Adds `activity_calls` (call log) and `signals` (mailbox); promotes `retry_count` to a separate `activity_attempts` table. See [DATA_MODELS.md](../DATA_MODELS.md) for the current shape — these will be added in a follow-up edit.
+- **Schema is larger than original `Workload` model.** Adds `activity_calls` (call log) and `signals` (mailbox); promotes `retry_count` to a separate `activity_attempts` table. These are the canonical schema in [DATA_MODELS.md](../DATA_MODELS.md) (v2.0).
 - **Existing `Checkpoint()` method on the `Workload` interface goes away.** Replaced by `Heartbeat` (intra-attempt) + replay (cross-attempt). Migration is a doc-only rename until code exists.
 
 ### Neutral
@@ -89,15 +89,16 @@ The signal delivery substrate is the most likely component to be swapped out as 
 
 ## Implementation Phasing
 
-| Phase | Scope |
-|---|---|
-| **Phase 1 MVP** | Single-attempt activities. `Activity` interface, `ctx.Heartbeat`, basic retry policy enforced by framework. No `RunChild`, no signals, no resume. Equivalent capability to current `Workload` design but with framework-managed retries. |
-| **Phase 2** | `RunChild` with sequential dispatch. Replay-based resume across `RunChild` boundaries. `activity_calls` table. `ctx.Sleep`, `ctx.Now`, `ctx.NewID` deterministic primitives. |
-| **Phase 2** | `SignalBus` interface + Postgres-backed impl. `ctx.AwaitSignal`. `signals` table. Signal-to-activity routing. |
-| **Phase 3** | Determinism linter for parent code. NATS JetStream-backed `SignalBus` impl as alternative. |
-| **Phase 4** | Per-call-site replay key tuning, replay performance optimization for large call counts. |
+This ADR describes the **engine capability sequence** — the order in which the activity-execution features land. These are *capability milestones*, not the system-wide delivery phases in [IMPLEMENTATION_PLAN.md](../../IMPLEMENTATION_PLAN.md) (which numbers 0–6 across the whole platform and apps). The cross-walk below is the single source of truth for which system phase delivers each capability; where this ADR and the plan ever disagree on numbering, the plan's phase numbers win and this column is the mapping.
 
-Signal support **must ship in Phase 2** — the agentic monitor use case is blocked without it. This is a deliberate departure from the prior implementation plan, which deferred signals to Phase 3.
+| Capability milestone | Scope | Delivered in system phase |
+|---|---|---|
+| **M1 — Single-attempt activities** | `Activity` interface, `ctx.Heartbeat`, framework-enforced retry policy. No `RunChild`, no signals, no resume. Equivalent to the old `Workload` capability but with framework-managed retries. | Plan Phase 1 (persistence + retries) |
+| **M2 — Composition + replay** | `RunChild` with sequential dispatch. Replay-based resume across `RunChild` boundaries. `activity_calls` table. | Plan Phase 3 (child activities + replay) |
+| **M3 — Deterministic primitives + signals** | `ctx.Sleep`, `ctx.Now`, `ctx.NewID`. `SignalBus` interface + Postgres-backed impl. `ctx.AwaitSignal`. `signals` table. Signal-to-activity routing. | Plan Phase 4 (timers + signals) |
+| **M4 — Hardening** | Determinism linter for parent code. NATS JetStream-backed `SignalBus` alternative. Per-call-site replay-key tuning and replay performance for large call counts. | Plan Phase 6 (HA, scale, hardening) |
+
+**Signals must ship before any self-orchestrated ingestion (Plan Phase 5).** They land in Plan Phase 4 (capability M3), ahead of ingestion in Phase 5 — the agentic-monitor and ingestion-supervisor use cases are blocked without them. (This corrected an earlier draft that deferred signals to Phase 3 of an older, since-superseded plan; the duplicate "Phase 2" rows in that draft conflated M2 and M3 and have been split.)
 
 ## Alternatives Considered
 
@@ -121,7 +122,7 @@ Activity calls `ctx.Suspend()` at known points; framework only frees the slot at
 
 - [ARCHITECTURE.md](../ARCHITECTURE.md) — system context this ADR modifies
 - [DATA_MODELS.md](../DATA_MODELS.md) — schema to be updated for `activity_calls`, `activity_attempts`, `signals`
-- [IMPLEMENTATION_PLAN.md](../IMPLEMENTATION_PLAN.md) — phasing to be revised; signals move from Phase 3 to Phase 2
+- [IMPLEMENTATION_PLAN.md](../../IMPLEMENTATION_PLAN.md) — system-wide delivery phases (0–6); see the capability cross-walk above for how engine milestones map onto them
 - [impl/PHASE_3_CHILD_ACTIVITIES_REPLAY.md](../impl/PHASE_3_CHILD_ACTIVITIES_REPLAY.md) — child activity and replay interface details
 - [impl/PHASE_4_TIMERS_SIGNALS.md](../impl/PHASE_4_TIMERS_SIGNALS.md) — timer and signal delivery design
 - Temporal documentation, *Workflows* and *Activities* sections — primary inspiration

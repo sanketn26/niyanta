@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://niyanta.example.com/schemas/dataconnector/checkpoint.schema.json",
+  "title": "ConnectorCheckpoint",
+  "description": "Small, durable, versioned connector checkpoint. Stored via the engine checkpoint model.",
+  "type": "object",
+  "required": ["version", "mode"],
+  "additionalProperties": true,
+  "properties": {
+    "version": { "type": "integer", "minimum": 1 },
+    "mode": {
+      "type": "string",
+      "enum": ["time_window", "time_window_with_cursor", "cursor", "object_offset",
+               "per_stream_cursor", "lsn_after_delivery", "offset_after_delivery"]
+    },
+    "last_successful_window_end": { "type": "string", "format": "date-time" },
+    "cursor": { "type": ["string", "null"] },
+    "dedupe_watermark": {
+      "type": "object",
+      "properties": {
+        "ttl_seconds": { "type": "integer", "minimum": 0 },
+        "keys_ref": { "type": "string" }
+      }
+    }
+  }
+}
