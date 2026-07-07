@@ -4,7 +4,7 @@
 **Last Updated**: 2026-06-03
 **Status**: Design Phase
 
-> **v2.0 is the engine API.** This document covers only the **platform** surface — activities, workers, health, and cross-cutting concerns (auth, errors, rate limiting, pagination, versioning). App-specific APIs live with their apps: connector/connection/control/runbook endpoints are in [../apps/dataconnector/API_SPEC.md](../apps/dataconnector/API_SPEC.md) and [../apps/llmops/LLMOPS_SPEC.md](../apps/llmops/LLMOPS_SPEC.md). The v1 `workloads` surface is renamed to `activities` per [adr/ADR-005-activity-execution-model.md](adr/ADR-005-activity-execution-model.md).
+> **v2.0 is the engine API.** This document covers only the **platform** surface — activities, workers, health, and cross-cutting concerns (auth, errors, rate limiting, pagination, versioning). Anything a consumer builds on top exposes its own API elsewhere; the engine's only domain concept is the activity. The v1 `workloads` surface is renamed to `activities` per [adr/ADR-005-activity-execution-model.md](adr/ADR-005-activity-execution-model.md).
 
 ## Table of Contents
 1. [Overview](#overview)
@@ -25,10 +25,10 @@
 
 Niyanta exposes two API surfaces:
 
-1. **Coordinator REST/gRPC API** — for clients to submit and manage **activities** and to administer workers and health. This is what apps build on; the activity is the only domain concept the engine exposes.
-2. **Internal Broker Protocol** — coordinator↔worker communication (see [DATA_MODELS.md](DATA_MODELS.md) §Broker Message Formats).
+1. **Coordinator REST/gRPC API** — for clients to submit and manage **activities** and to administer workers and health. This is what consumers build on; the activity is the only domain concept the engine exposes.
+2. **Internal Control-Plane Protocol** — coordinator↔worker communication (see [DATA_MODELS.md](DATA_MODELS.md) §Broker Message Formats).
 
-This document focuses on the Coordinator API. Apps layer their own higher-level APIs (connector connections, ingestion views, findings, runbooks) on top; those are not engine concerns and are specified in the app docs.
+This document focuses on the Coordinator API. Consumers layer their own higher-level APIs on top; those are not engine concerns.
 
 ---
 
@@ -81,8 +81,8 @@ Idempotency-Key: <uuid>   (optional; see Idempotency)
 **Request Body**:
 ```json
 {
-  "activity_type": "ingestion_supervisor",
-  "input_json": { "connection_id": "conn_123" },
+  "activity_type": "sample_pipeline",
+  "input_json": { "item_id": "item_123" },
   "priority": 10,
   "affinity_rules": { "hard_affinity": { "worker_tags": { "hardware": "gpu" } } },
   "retry_policy": { "max_attempts": 3, "backoff": "exponential" }
@@ -115,12 +115,14 @@ type ActivitySubmitRequest struct {
 
 **Endpoint**: `GET /activities/{activity_id}`
 
+**Query Parameters**: `wait` (optional, e.g. `30s`, max `60s`) — long-poll: the response returns early as soon as the activity reaches a terminal state (`COMPLETED`/`FAILED`/`CANCELLED`), otherwise after the wait window with the current state. This is the preferred completion-watch mechanism; clients should not poll in a tight loop.
+
 **Response**: `200 OK`
 ```json
 {
   "activity_id": "act_abc123",
   "customer_id": "cust_abc123",
-  "activity_type": "ingestion_supervisor",
+  "activity_type": "sample_pipeline",
   "parent_activity_id": null,
   "root_activity_id": "act_abc123",
   "status": "SUSPENDED",
@@ -128,7 +130,7 @@ type ActivitySubmitRequest struct {
   "wake_at": "2026-06-03T12:40:00Z",
   "priority": 10,
   "worker_id": null,
-  "input_json": { "connection_id": "conn_123" },
+  "input_json": { "item_id": "item_123" },
   "result_json": null,
   "error_json": null,
   "current_attempt": 1,
@@ -150,7 +152,7 @@ type ActivitySubmitRequest struct {
 
 **Query Parameters**: `status`, `activity_type`, `parent_activity_id`, `root_activity_id`, `limit` (default 50, max 100), `cursor` (preferred) or `offset`, `order_by` (default `created_at`), `order` (`asc`|`desc`).
 
-**Example**: `GET /activities?status=RUNNING&activity_type=diagnose&limit=20&order_by=priority&order=desc`
+**Example**: `GET /activities?status=RUNNING&activity_type=sample_pipeline&limit=20&order_by=priority&order=desc`
 
 **Response**: `200 OK`
 ```json
@@ -163,12 +165,20 @@ type ActivitySubmitRequest struct {
 
 | Operation | Endpoint | Notes |
 |-----------|----------|-------|
-| Cancel | `POST /activities/{id}:cancel` | Cancels the activity and its in-flight children. Body: `{ "reason": "..." }`. |
+| Cancel | `POST /activities/{id}:cancel` | Cancels the activity and its in-flight children (depth-first; the suspended call site returns `ErrCancelled`). Body: `{ "reason": "..." }`. |
 | Pause | `POST /activities/{id}:pause` | Pauses at the next safe suspend point. |
 | Resume | `POST /activities/{id}:resume` | Resumes a paused activity. |
-| Signal | `POST /activities/{id}:signal` | Deliver an external event. Body: `{ "name": "...", "payload": { } }`. Routes to the activity's mailbox. |
+| Signal | `POST /activities/{id}:signal` | Deliver an external event. Body: `{ "name": "...", "payload": { } }`. Accepts `Idempotency-Key` header — a retried send with the same key is one mailbox entry. |
 
 **Response**: `200 OK` with the updated activity, or `409 INVALID_STATE` if the transition is not allowed.
+
+**Operator recovery operations** (Phase 5; RBAC `operator`+, every call audited — the escape hatches for nondeterminism poisoning per ADR-005 G6):
+
+| Operation | Endpoint | Notes |
+|-----------|----------|-------|
+| Force-fail | `POST /activities/{id}:force-fail` | Terminal `FAILED` with operator-supplied reason. |
+| Force-complete | `POST /activities/{id}:force-complete` | Terminal `COMPLETED` with operator-supplied `result_json`. |
+| Truncate replay | `POST /activities/{id}:truncate-replay` | Drops the call-log suffix from a divergent index and re-enqueues. Body: `{ "from_call_index": N, "confirm": "<token>" }`. |
 
 ---
 
@@ -202,6 +212,18 @@ Streams or pages structured log lines for the activity and (optionally, `?includ
 **Endpoint**: `GET /activities/{activity_id}/audit`
 
 Returns `audit_events` for the activity (created, scheduled, child_dispatched, suspended, resumed, signal_received, completed, redistributed, …).
+
+---
+
+#### 1.8 Inspection Reads (Phase 5)
+
+The console's data sources; also `curl`-debuggable.
+
+| Endpoint | Returns |
+|----------|---------|
+| `GET /activities/{id}/calls` | The call log for the current execution: `call_index`, `call_type`, `args_hash`, `child_activity_id`, completion state, recorded result. For a suspended activity, the last incomplete entry *is* "where it is parked." |
+| `GET /activities/{id}/signals` | The signal mailbox: pending and delivered entries. |
+| `GET /activities/{id}/executions` | The `ContinueAsNew` chain: one entry per execution (`execution_seq`, input, result, call count, timings). |
 
 ---
 
@@ -239,7 +261,7 @@ Requires an internal admin permission, not a customer key.
 
 ```json
 // GET /workers
-{ "workers": [ { "id": "worker-5", "status": "HEALTHY", "activity_types": ["ingestion_supervisor", "diagnose"], "capacity_total": 10, "capacity_used": 3, "tags": { "region": "us-west-2" }, "last_heartbeat": "..." } ] }
+{ "workers": [ { "id": "worker-5", "status": "HEALTHY", "activity_types": {"sample_pipeline": "1.2.3", "sample_leaf": "1.2.3"}, "capacity_total": 10, "capacity_used": 3, "tags": { "region": "us-west-2" }, "last_heartbeat": "..." } ] }
 ```
 
 ---
@@ -249,14 +271,14 @@ Requires an internal admin permission, not a customer key.
 | Endpoint | Purpose | Response |
 |----------|---------|----------|
 | `GET /health` | Liveness | `200 {"status":"ok"}` |
-| `GET /ready` | Readiness (DB + broker reachable, leader known) | `200`/`503` with dependency detail |
+| `GET /ready` | Readiness (DB reachable, leader known; broker included only if a Phase 7 substrate is configured) | `200`/`503` with dependency detail |
 | `GET /metrics` | Prometheus exposition | `text/plain` metrics |
 
 ```
 # GET /metrics (excerpt)
 # HELP niyanta_activity_attempts_total Total activity attempts
 # TYPE niyanta_activity_attempts_total counter
-niyanta_activity_attempts_total{activity_type="diagnose",result="completed"} 1024
+niyanta_activity_attempts_total{activity_type="sample_pipeline",result="completed"} 1024
 # HELP niyanta_activity_duration_seconds Activity execution duration
 # TYPE niyanta_activity_duration_seconds histogram
 ```
@@ -389,7 +411,7 @@ resp, err := client.SubmitActivity(ctx, req)
   "error": {
     "code": "INVALID_INPUT",
     "message": "Activity type 'invalid_type' is not registered by any worker",
-    "details": { "known_types": ["ingestion_supervisor", "diagnose"] },
+    "details": { "known_types": ["sample_pipeline", "sample_leaf"] },
     "request_id": "req_abc123"
   }
 }
@@ -508,8 +530,8 @@ client := niyanta.NewClient(niyanta.Config{
 
 // Submit an activity
 resp, err := client.SubmitActivity(ctx, &niyanta.ActivitySubmitRequest{
-    ActivityType: "ingestion_supervisor",
-    InputJSON:    map[string]any{"connection_id": "conn_123"},
+    ActivityType: "sample_pipeline",
+    InputJSON:    map[string]any{"item_id": "item_123"},
 })
 
 // Poll, or stream status
@@ -521,8 +543,8 @@ act, err := client.GetActivity(ctx, resp.ActivityID)
 ```python
 client = niyanta.Client(base_url="https://api.niyanta.example.com/v1", api_key=api_key)
 
-resp = client.submit_activity(activity_type="ingestion_supervisor",
-                              input_json={"connection_id": "conn_123"})
+resp = client.submit_activity(activity_type="sample_pipeline",
+                              input_json={"item_id": "item_123"})
 act = client.get_activity(resp.activity_id)
 ```
 
@@ -532,8 +554,6 @@ act = client.get_activity(resp.activity_id)
 
 - [adr/ADR-005-activity-execution-model.md](adr/ADR-005-activity-execution-model.md) - activity execution model
 - [ARCHITECTURE.md](ARCHITECTURE.md) - platform architecture overview
-- [DATA_MODELS.md](DATA_MODELS.md) - schemas and broker message formats
-- [../apps/dataconnector/API_SPEC.md](../apps/dataconnector/API_SPEC.md) - Data Connector app API
-- [../apps/llmops/LLMOPS_SPEC.md](../apps/llmops/LLMOPS_SPEC.md) - LLMOps app API
+- [DATA_MODELS.md](DATA_MODELS.md) - schemas and message formats
 - [../IMPLEMENTATION_PLAN.md](../IMPLEMENTATION_PLAN.md) - phased delivery plan
 ```

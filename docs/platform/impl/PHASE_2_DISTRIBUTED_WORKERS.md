@@ -1,6 +1,8 @@
 # Phase 2: Distributed Coordinator And Workers
 
-**Goal**: Split execution into a coordinator and many workers. Use NATS for control messages. Detect worker failure and redistribute activity attempts.
+**Goal**: Split execution into a coordinator and many workers. Dispatch is **Postgres-native** — workers pull with `FOR UPDATE SKIP LOCKED`, woken by `LISTEN/NOTIFY`. Detect worker failure, redistribute attempts, and prove that a stale worker **cannot write** after redistribution.
+
+No broker. Postgres remains the only external dependency. The `TaskQueue`/`EventBus` interfaces stay, so a NATS JetStream implementation can drop in at Phase 7 if measured scale demands it.
 
 ## Files To Add
 
@@ -8,153 +10,95 @@
 cmd/coordinator/main.go
 cmd/worker/main.go
 internal/broker/interfaces.go
-internal/broker/nats/event_bus.go
+internal/broker/postgres/notify_bus.go
 internal/scheduler/scheduler.go
 internal/scheduler/affinity.go
 internal/worker/runtime.go
 internal/coordinator/server.go
 ```
 
-## Broker Interface
+## Dispatch Model: Pull, Not Push
+
+Workers pull runnable attempts directly from Postgres, filtered by the activity types they advertise:
 
 ```go
-// internal/broker/interfaces.go
-package broker
-
-import "context"
-
-type Message struct {
-    Subject string
-    Data    []byte
-}
-
-type Handler func(context.Context, Message) error
-
-type EventBus interface {
-    Publish(ctx context.Context, subject string, data []byte) error
-    Subscribe(ctx context.Context, subject string, handler Handler) error
-    Request(ctx context.Context, subject string, data []byte) ([]byte, error)
-}
+const claimSQL = `
+WITH next AS (
+    SELECT a.id
+    FROM activity_attempts a
+    JOIN activities act ON act.id = a.activity_id
+    WHERE a.status = 'PENDING'
+      AND a.not_before <= NOW()
+      AND act.type = ANY($1)          -- worker's advertised activity types
+    ORDER BY a.not_before, a.id
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE activity_attempts a
+SET status = 'RUNNING', worker_id = $3, started_at = NOW(),
+    lease_expires_at = NOW() + $4::interval
+FROM next WHERE a.id = next.id
+RETURNING a.id, a.activity_id, a.number
+`
 ```
 
-## Worker Registration
+Latency: the coordinator (and submit path) issues `NOTIFY task_ready, '<activity_type>'` after enqueueing; idle workers hold a `LISTEN` connection and claim immediately. The poll loop (every 2s) remains as the fallback, so a dropped notification only costs latency, never correctness.
+
+```go
+// internal/broker/postgres/notify_bus.go — EventBus over LISTEN/NOTIFY.
+// Payloads are hints only; Postgres rows are the source of truth.
+```
+
+## Worker Registration And Heartbeats
 
 ```go
 type Worker struct {
-    ID             string
-    Status         string
-    CapacityTotal  int
-    CapacityUsed   int
-    Capabilities   []string
-    IsolationPools []string
-    LastHeartbeat  time.Time
+    ID            string
+    Status        string            // HEALTHY | DRAINING | DEAD
+    CapacityTotal int
+    CapacityUsed  int
+    Capabilities  map[string]string // activity type -> version
+    Tags          map[string]string
+    LastHeartbeat time.Time
 }
 ```
 
-Worker startup:
+Worker startup: register (upsert `workers` row), start the heartbeat loop (every 30s: renew `last_heartbeat`, renew leases for in-flight attempts, report capacity + in-flight inventory), start the claim loop.
 
-```go
-func (w *Runtime) Start(ctx context.Context) error {
-    if err := w.registry.Register(ctx, w.info()); err != nil {
-        return err
-    }
+## Leases And Fencing
 
-    go w.heartbeatLoop(ctx)
+The lease lives on the **attempt** (`activity_attempts.lease_expires_at`), renewed by heartbeat. The fence token lives on the **activity** (`activities.generation`), bumped on every redistribution.
 
-    subject := "worker." + w.id + ".commands"
-    return w.bus.Subscribe(ctx, subject, w.handleCommand)
-}
+The Phase 1 write-path fencing invariant now gets its distributed acceptance test: after redistribution bumps the generation, **every** write from the old worker — completion, failure, heartbeat state, lease renewal — fails with `ErrFenced` at the storage layer:
+
+```sql
+-- every mutating statement carries the caller's generation
+UPDATE activity_attempts SET status = 'COMPLETED', ...
+WHERE id = $1
+  AND EXISTS (SELECT 1 FROM activities
+              WHERE id = $2 AND generation = $3);
+-- zero rows updated => ErrFenced => worker stops
 ```
 
-## Assignment Command
+Command-path rejection (a worker ignoring a stale instruction) is necessary but not sufficient; the write path is where split-brain corrupts state.
 
-```go
-type AssignAttemptCommand struct {
-    AttemptID  string `json:"attempt_id"`
-    ActivityID string `json:"activity_id"`
-    Generation int64  `json:"generation"`
-}
-```
+## Scheduler Responsibilities
 
-Workers must reject commands whose generation is stale.
-
-```go
-func (w *Runtime) handleAssign(ctx context.Context, cmd AssignAttemptCommand) error {
-    activity, err := w.activities.Get(ctx, cmd.ActivityID)
-    if err != nil {
-        return err
-    }
-    if activity.Generation != cmd.Generation {
-        return ErrStaleGeneration
-    }
-    go w.executor.RunAttempt(ctx, cmd.AttemptID)
-    return nil
-}
-```
-
-## Scheduler Loop
+With pull-based dispatch, the coordinator's scheduler does **admission and placement policy**, not delivery:
 
 ```go
 func (s *Scheduler) runCycle(ctx context.Context) {
-    pending, err := s.attempts.ListPending(ctx, s.cfg.BatchSize)
-    if err != nil || len(pending) == 0 {
-        return
-    }
-
-    workers, err := s.workers.ListAvailable(ctx)
-    if err != nil || len(workers) == 0 {
-        return
-    }
-
-    for _, att := range pending {
-        activity, err := s.activities.Get(ctx, att.ActivityID)
-        if err != nil {
-            continue
-        }
-        worker := s.selectWorker(activity, workers)
-        if worker == nil {
-            continue
-        }
-        if err := s.dispatch(ctx, att, activity, worker); err != nil {
-            s.logger.Warn("dispatch failed", "attempt_id", att.ID, "err", err)
-        }
-    }
+    // 1. Admission: move PENDING activities to runnable attempts
+    //    (quota checks land in Phase 5; Phase 2 admits everything).
+    // 2. Affinity: stamp placement constraints onto the attempt row
+    //    (hard = SQL filter on claim; soft = score hint; anti = exclusion set).
+    // 3. Notify: NOTIFY task_ready for newly runnable work.
 }
 ```
 
-## Worker Selection
-
-Worker selection filters before scoring:
-
-```go
-func (s *Scheduler) selectWorker(a *models.Activity, workers []*models.Worker) *models.Worker {
-    var best *models.Worker
-    bestScore := -1
-
-    for _, w := range workers {
-        if w.CapacityUsed >= w.CapacityTotal {
-            continue
-        }
-        if !supports(w.Capabilities, a.Type) {
-            continue
-        }
-        if !allowedIsolationPool(w.IsolationPools, a.IsolationPool) {
-            continue
-        }
-
-        score := w.CapacityTotal - w.CapacityUsed
-        if score > bestScore {
-            best = w
-            bestScore = score
-        }
-    }
-    return best
-}
-```
+Hard affinity is enforced in the claim query (workers claim only what they are allowed to run); soft affinity is a scoring hint column workers order by; anti-affinity adds an exclusion predicate (needs `GetActivitiesByWorker`).
 
 ## Failure Detection
-
-Coordinator loop:
 
 ```go
 func (c *Coordinator) detectDeadWorkers(ctx context.Context) error {
@@ -163,28 +107,37 @@ func (c *Coordinator) detectDeadWorkers(ctx context.Context) error {
         return err
     }
     for _, w := range dead {
+        // Interrupt in-flight attempts, bump each activity's generation,
+        // enqueue replacement attempts — one transaction per activity.
         attempts, err := c.attempts.InterruptRunningByWorker(ctx, w.ID, "worker heartbeat timeout")
         if err != nil {
             return err
         }
         for _, att := range attempts {
-            _ = c.retry.EnqueueReplacement(ctx, att)
+            _ = c.retry.EnqueueReplacement(ctx, att) // bumps generation
         }
     }
     return nil
 }
 ```
 
+A separate sweep redistributes attempts whose lease expired even though the worker still heartbeats (stuck attempt, live worker).
+
+## Graceful Shutdown
+
+SIGTERM → worker sets itself `DRAINING` (stops claiming), finishes or checkpoints in-flight attempts, deregisters. Drain timeout default 5 minutes, then in-flight attempts are released for redistribution.
+
 ## Acceptance Tests
 
-1. `docker compose up` starts Postgres, NATS, one coordinator, and two workers.
-2. Kill a worker mid-activity; the attempt is interrupted and retried on another worker.
-3. Stale generation commands are rejected.
-4. A dedicated-isolation activity is only assigned to workers in its isolation pool.
+1. `docker compose up` starts Postgres, one coordinator, and two workers — nothing else.
+2. Kill a worker mid-activity; the attempt is interrupted, generation bumped, and retried on another worker within 60s.
+3. **Stale-writer test**: `SIGSTOP` a worker mid-attempt; lease expires; redistribution happens; `SIGCONT` the worker — its completion, heartbeat, and lease-renewal writes all return `ErrFenced`; the redistributed attempt's result is the recorded one.
+4. Dispatch latency p95 < 1s submit→RUNNING on an idle system (NOTIFY path, not poll-bound).
+5. A hard-affinity activity (e.g. tag `gpu`) is only ever claimed by matching workers.
 
 ## Done When
 
-- Workers are stateless.
-- Coordinator owns scheduling decisions.
+- Workers are stateless and pull their own work.
+- Coordinator owns admission, placement policy, and failure detection — not message delivery.
 - Activity progress survives worker death.
-
+- No write from a fenced worker can ever land.

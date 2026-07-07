@@ -6,27 +6,21 @@ The docs drifted once (a workload-era data model and API survived an architectur
 
 ## The one rule
 
-**The platform is a composable activity runner. Apps are compositions of activities.** Keep them separate:
+**Niyanta is a durable activity execution engine and nothing else.** Every doc in this repo describes the engine: activities, attempts, call log, signals, workers, scheduling, leases, fencing, versioning, the console, and the observability of all of it. The engine is agnostic to what an activity *does*.
 
-- Engine concerns → `docs/platform/` (activities, attempts, call log, signals, workers, scheduling, leases, health). Engine-agnostic to what an activity *does*.
-- App concerns → `docs/apps/<app>/` (connector definitions, runbooks, ingestion planning, diagnosis). Each app owns its config language and state.
-
-If you're about to add a connector field or a runbook concept to a `platform/` doc, stop — it belongs in `apps/`.
+If you're about to document a domain concept — a connector field, a pipeline stage, a runbook, anything that gives an activity's payload *meaning* — stop. That belongs to whatever product is built on the engine, documented wherever that product lives, not here. To the engine (and to these docs), such things are opaque `input_json`.
 
 ## Layout
 
 ```
 docs/
-  README.md              index — update when adding/moving a doc or app
+  README.md              index — update when adding/moving a doc
   GETTING_STARTED.md
   CONTRIBUTING_DOCS.md   (this file)
-  IMPLEMENTATION_PLAN.md cross-cutting roadmap
-  platform/              engine: ARCHITECTURE, DATA_MODELS, API_SPEC, adr/, impl/
-  apps/<app>/            ARCHITECTURE, *_SPEC, API_SPEC, OPERATIONS..., impl/, schemas/, fixtures/
-api/openapi/             machine-readable API stubs (engine + per app)
+  IMPLEMENTATION_PLAN.md roadmap (engine-only, phases 0–7)
+  platform/              ARCHITECTURE, DATA_MODELS, API_SPEC, adr/, impl/
+api/openapi/             machine-readable engine API (niyanta-v1.yaml)
 ```
-
-When you add an app, mirror the dataconnector/llmops shape: an architecture doc, a spec, an API spec, operations/failure semantics, `impl/` phases + README, `schemas/`. Add it to [README.md](README.md) and to the platform ARCHITECTURE §Activity Compositions list.
 
 ## Vocabulary (canonical)
 
@@ -35,29 +29,24 @@ When you add an app, mirror the dataconnector/llmops shape: an architecture doc,
 | activity, activity type, attempt, child activity | workload, workload type, job |
 | call log (`activity_calls`), replay, suspend/resume | manual checkpoint loop |
 | `activity_attempts` (per-attempt rows) | `retry_count` integer |
-| `input_json` / opaque payload | workload config in the engine |
-| composition / cookbook | "app layer" / "app SPI" / "app runtime" |
+| `input_json` / opaque payload | domain config in the engine |
+| execution (one replay history; `ContinueAsNew` starts a new one) | — |
 
-The canonical activity model is [platform/adr/ADR-005-activity-execution-model.md](platform/adr/ADR-005-activity-execution-model.md). The canonical schema is [platform/DATA_MODELS.md](platform/DATA_MODELS.md) (v2). The v1→v2 map is the appendix there.
+The canonical activity model is [platform/adr/ADR-005-activity-execution-model.md](platform/adr/ADR-005-activity-execution-model.md). The canonical schema is [platform/DATA_MODELS.md](platform/DATA_MODELS.md). The v1→v2 migration map is the appendix there.
 
 ## Phase numbering
 
 There are two numbering schemes — don't conflate them:
 
-- **System delivery phases** 0–6 in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) (platform 0–4, dataconnector 5–6, llmops 1–3 within its own track).
-- **Engine capability milestones** M1–M4 in ADR-005, mapped to system phases in the ADR's cross-walk table.
+- **Delivery phases** 0–7 in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md), each with a guide in [platform/impl/](platform/impl/README.md).
+- **Engine capability milestones** M1–M4 in ADR-005, mapped to delivery phases in the ADR's cross-walk table.
 
-When you change phasing, update the ADR cross-walk and the plan together. The plan's phase numbers win.
-
-## Config languages are the apps', not the engine's
-
-The connector YAML and LLMOps runbook/policy languages are **not Niyanta config**. The engine never parses them. Document them under the owning app; never add them to platform docs as engine features.
+When you change phasing, update the ADR cross-walk, the plan, and the impl README together. The plan's phase numbers win.
 
 ## Source of truth for contracts
 
-- API shapes: the OpenAPI files in `api/openapi/` are the source of truth; the `*_SPEC.md` / `API_SPEC.md` prose explains them. Keep them in sync — if you add an endpoint to a doc, add it to the matching OpenAPI stub.
-- Authored artifacts (connector definitions, runbooks, checkpoints, findings): the JSON Schemas in `docs/apps/*/schemas/` are enforceable; YAML examples in prose must validate against them.
-- Redaction: [apps/llmops/REDACTION_CONTRACT.md](apps/llmops/REDACTION_CONTRACT.md) + its `fixtures/`.
+- API shapes: [api/openapi/niyanta-v1.yaml](../api/openapi/niyanta-v1.yaml) is the source of truth; [platform/API_SPEC.md](platform/API_SPEC.md) prose explains it. If you add an endpoint to one, add it to the other in the same change.
+- Execution-model guarantees (exactly-once dispatch, fencing, determinism, `ContinueAsNew`): ADR-005 states them; DATA_MODELS encodes the invariants; the impl phase guides carry the acceptance tests. All three move together.
 
 ## Before you commit: checks
 
@@ -73,12 +62,14 @@ while IFS= read -r src; do
   done
 done < <(git ls-files '*.md')
 
-# 2. OpenAPI + JSON Schema parse
-for f in api/openapi/*.yaml; do python3 -c "import yaml; yaml.safe_load(open('$f'))"; done
-for f in docs/apps/*/schemas/*.json; do python3 -c "import json; json.load(open('$f'))"; done
+# 2. OpenAPI parses (ruby ships with macOS; PyYAML is not in the Python stdlib)
+ruby -ryaml -e "YAML.load_file('api/openapi/niyanta-v1.yaml')"
 
 # 3. No workload-era vocabulary crept into platform/ (allow only the migration map / ADR history)
 grep -rniE 'workload' docs/platform/ | grep -viE 'v1|supersed|migration|original|Workload interface' && echo "review: stray workload terms" || echo "vocab ok"
+
+# 4. No domain/product concepts crept back into the engine docs
+grep -rniE 'connector|runbook|ingestion|llmops' docs/platform/ docs/*.md | grep -viE 'agnostic|opaque|does not|never|no longer|removed' && echo "review: possible domain leakage" || echo "boundary ok"
 ```
 
-A doc PR that adds an endpoint, artifact, or app without updating the matching OpenAPI/schema and the index is incomplete.
+A doc PR that adds an endpoint without updating the matching OpenAPI, or changes a guarantee without updating ADR-005 + DATA_MODELS + the impl guide, is incomplete.

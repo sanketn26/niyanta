@@ -6,13 +6,13 @@
 
 > **v2.0 supersedes the v1 workload model.** Niyanta is a composable activity runner; its canonical persisted state is the **activity** and its execution record (attempts, call log, signals), per [adr/ADR-005-activity-execution-model.md](adr/ADR-005-activity-execution-model.md). The earlier `workloads` / `workload_configs` / `retry_count` schema is replaced. A migration map from the old vocabulary is in the appendix.
 
-This document defines the **platform** schema only — the engine's state for running activities and resuming them after failure. It is application-agnostic: it knows about activities, attempts, the call log, signals, checkpoints, workers, tenants, and audit. It does **not** know about connectors, runbooks, or any app's domain. Apps add their own tables (see [../apps/dataconnector/DATA_CONNECTOR_SPEC.md](../apps/dataconnector/DATA_CONNECTOR_SPEC.md) §Storage Extensions and [../apps/llmops/LLMOPS_SPEC.md](../apps/llmops/LLMOPS_SPEC.md) §Storage Extensions).
+This document defines the **platform** schema only — the engine's state for running activities and resuming them after failure. It is use-case agnostic: it knows about activities, attempts, the call log, signals, checkpoints, workers, tenants, and audit. It does **not** know about any consumer's domain. Consumers may add their own tables in the same Postgres; they never alter core tables.
 
 ## Table of Contents
 1. [Overview](#overview)
 2. [Database Schema](#database-schema)
 3. [State Storage Models](#state-storage-models)
-4. [Broker Message Formats](#broker-message-formats)
+4. [Control-Plane Message Formats](#control-plane-message-formats)
 5. [Go Struct Definitions](#go-struct-definitions)
 6. [Data Validation Rules](#data-validation-rules)
 7. [Indexing Strategy](#indexing-strategy)
@@ -33,7 +33,7 @@ Niyanta uses PostgreSQL as the primary state storage. The model is built around 
 
 Supporting tables: `customers` (tenants), `workers`, `checkpoints` (intra-attempt heartbeat state), `audit_events`, `coordinator_state`, `idempotency_keys`.
 
-This document defines table schemas, broker message formats, Go structs, validation rules, and invariants.
+This document defines table schemas, control-plane message formats, Go structs, validation rules, and invariants.
 
 ---
 
@@ -148,12 +148,14 @@ CREATE TABLE activities (
     status              activity_status NOT NULL DEFAULT 'PENDING',
     priority            INT NOT NULL DEFAULT 10,
     affinity_rules      JSONB,
-    input_json          JSONB NOT NULL,              -- opaque to the engine; meaningful to the activity's app
-    result_json         JSONB,
-    error_json          JSONB,                       -- {message, type: transient|permanent, ...}
+    input_json          JSONB NOT NULL,              -- opaque to the engine; size-capped (default 256KB)
+    result_json         JSONB,                       -- size-capped (default 256KB)
+    error_json          JSONB,                       -- {message, type: transient|permanent|nondeterminism, ...}
     retry_policy_json   JSONB NOT NULL DEFAULT '{"max_attempts": 3, "backoff": "exponential"}',
-    lease_expires_at    TIMESTAMP WITH TIME ZONE,
     generation          BIGINT NOT NULL DEFAULT 1,   -- fencing token, bumped on redistribution
+    pinned_version      VARCHAR(64),                 -- G1: code version stamped at first suspend; resume only on matching workers
+    execution_seq       INT NOT NULL DEFAULT 1,      -- G5: current execution in the ContinueAsNew chain
+    superseded_by       VARCHAR(64),                 -- G5: set on an execution completed via ContinueAsNew (audit chain)
     suspend_reason      VARCHAR(32),                 -- run_child | sleep | await_signal (when SUSPENDED)
     wake_at             TIMESTAMP WITH TIME ZONE,     -- for Sleep / AwaitSignal timeout
     created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
@@ -169,17 +171,19 @@ CREATE INDEX idx_activities_worker         ON activities(worker_id) WHERE worker
 CREATE INDEX idx_activities_parent         ON activities(parent_activity_id) WHERE parent_activity_id IS NOT NULL;
 CREATE INDEX idx_activities_root           ON activities(root_activity_id);
 CREATE INDEX idx_activities_priority       ON activities(customer_id, status, priority DESC) WHERE status = 'PENDING';
-CREATE INDEX idx_activities_lease          ON activities(lease_expires_at) WHERE lease_expires_at IS NOT NULL;
+CREATE INDEX idx_activities_pinned         ON activities(activity_type, pinned_version) WHERE pinned_version IS NOT NULL;
 CREATE INDEX idx_activities_wake           ON activities(wake_at) WHERE status = 'SUSPENDED' AND wake_at IS NOT NULL;
 ```
 
+> The execution **lease lives on the attempt** (see `activity_attempts`), not here — a lease belongs to a physical execution. The activity carries only the `generation` fence token.
+
 **Notes**:
 
-- `activity_type` is registered by an app and advertised by workers as a capability. The engine does not interpret it.
-- `input_json` / `result_json` are opaque payloads — a connector definition or an LLMOps runbook lives here as far as the engine is concerned.
+- `activity_type` is registered by consumer code and advertised by workers as a capability (with a version). The engine does not interpret it.
+- `input_json` / `result_json` are opaque payloads — whatever domain config or result a consumer puts here, the engine never parses it. Both are size-capped (default 256KB); child results are re-read on every replay, and the cap is what keeps replay cheap.
 - `parent_activity_id` makes the composition tree explicit; a `SUSPENDED` parent waiting on a child holds no worker slot.
 - `generation` is the fence token; a stale worker resuming with an old generation is rejected (split-brain prevention).
-- There is no `workload_config_id`. Reusable configuration is an app concern (e.g. the connector definition); the engine stores only the per-activity `input_json`.
+- There is no `workload_config_id`. Reusable configuration is a consumer concern; the engine stores only the per-activity `input_json`.
 
 **Example `affinity_rules`** (unchanged from v1 semantics, applies to dispatch of any activity, parent or child):
 
@@ -197,25 +201,45 @@ CREATE INDEX idx_activities_wake           ON activities(wake_at) WHERE status =
 
 **Purpose**: One row per physical execution attempt. Replaces the v1 `retry_count` integer with a full per-attempt audit trail — essential for unattended retries.
 
+Attempts have their **own status enum** — the physical lifecycle differs from the logical one (`INTERRUPTED` and `FENCED` exist only here; `SUSPENDED`/`PAUSED` never do).
+
 ```sql
+CREATE TYPE attempt_status AS ENUM (
+    'PENDING',       -- enqueued, claimable by a worker
+    'RUNNING',
+    'COMPLETED',
+    'FAILED',
+    'INTERRUPTED',   -- worker died / lease expired / restart recovery
+    'FENCED'         -- terminal write rejected: stale generation
+);
+
 CREATE TABLE activity_attempts (
     id                  BIGSERIAL PRIMARY KEY,
     activity_id         VARCHAR(64) NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
     attempt_number      INT NOT NULL,
+    execution_seq       INT NOT NULL DEFAULT 1,      -- which ContinueAsNew execution this attempt belongs to
     worker_id           VARCHAR(64) REFERENCES workers(id) ON DELETE SET NULL,
     generation          BIGINT NOT NULL,
-    status              activity_status NOT NULL,
+    status              attempt_status NOT NULL DEFAULT 'PENDING',
+    not_before          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),  -- retry backoff gate
+    lease_expires_at    TIMESTAMP WITH TIME ZONE,    -- renewed by worker heartbeat; expiry => redistribution
     error_json          JSONB,
-    started_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    started_at          TIMESTAMP WITH TIME ZONE,
     ended_at            TIMESTAMP WITH TIME ZONE,
-    UNIQUE(activity_id, attempt_number)
+    UNIQUE(activity_id, execution_seq, attempt_number)
 );
 
 CREATE INDEX idx_attempts_activity ON activity_attempts(activity_id, attempt_number DESC);
+CREATE INDEX idx_attempts_pending  ON activity_attempts(not_before, id) WHERE status = 'PENDING';
+CREATE INDEX idx_attempts_lease    ON activity_attempts(lease_expires_at) WHERE status = 'RUNNING';
 CREATE INDEX idx_attempts_worker   ON activity_attempts(worker_id) WHERE worker_id IS NOT NULL;
 ```
 
-**Invariant**: the `activities` row records the *logical* execution; `activity_attempts` rows record the *physical* retries. The current attempt is `MAX(attempt_number)`.
+**Invariants**:
+
+- The `activities` row records the *logical* execution; `activity_attempts` rows record the *physical* retries. The current attempt is `MAX(attempt_number)` within the current `execution_seq`.
+- The dispatch queue **is** `idx_attempts_pending` — workers claim with `FOR UPDATE SKIP LOCKED`.
+- **Write-path fencing (G3)**: every mutating write on an attempt (complete, fail, heartbeat, lease renewal) is conditional on the activity's `generation` matching the writer's; a miss returns `ErrFenced` and the attempt is marked `FENCED`.
 
 ---
 
@@ -229,25 +253,27 @@ CREATE TYPE activity_call_type AS ENUM ('run_child', 'sleep', 'await_signal');
 CREATE TABLE activity_calls (
     id                  BIGSERIAL PRIMARY KEY,
     activity_id         VARCHAR(64) NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+    execution_seq       INT NOT NULL DEFAULT 1,     -- G5: scoped to the current ContinueAsNew execution
     call_index          INT NOT NULL,               -- deterministic position in the parent body
     call_type           activity_call_type NOT NULL,
     child_activity_id   VARCHAR(64) REFERENCES activities(id) ON DELETE SET NULL,  -- for run_child
     args_hash           VARCHAR(80),                -- detects nondeterministic divergence on replay
-    result_json         JSONB,                      -- recorded child result / sleep completion / signal payload
+    result_json         JSONB,                      -- recorded child result / sleep completion / signal payload (size-capped)
     completed           BOOLEAN NOT NULL DEFAULT FALSE,
     created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     completed_at        TIMESTAMP WITH TIME ZONE,
-    UNIQUE(activity_id, call_index)
+    UNIQUE(activity_id, execution_seq, call_index)
 );
 
-CREATE INDEX idx_calls_activity ON activity_calls(activity_id, call_index);
+CREATE INDEX idx_calls_activity ON activity_calls(activity_id, execution_seq, call_index);
 CREATE INDEX idx_calls_child    ON activity_calls(child_activity_id) WHERE child_activity_id IS NOT NULL;
 ```
 
 **Invariants**:
 
-- `call_index` is assigned in deterministic body order; a replay that produces a different `args_hash` at a given index indicates a determinism violation and fails fast.
-- Replay cost is bounded by call count, not wall-clock duration (a 30-day monitor with 50 calls replays 50 lookups).
+- `call_index` is assigned in deterministic body order; a replay that produces a different `args_hash` at a given index is a determinism violation — the activity fails with `error_json.type = "nondeterminism"` and is **not retried automatically** (G6; operator recovery via `:truncate-replay` / `:force-*`).
+- **Exactly-once dispatch (G4)**: the call-log append and child creation commit in one transaction; replay never re-dispatches a logged call — an incomplete entry means re-suspend and wait.
+- Replay loads only the **current** `execution_seq`; `ContinueAsNew` starts a fresh one, bounding replay cost regardless of activity lifetime (G5).
 
 ---
 
@@ -261,15 +287,38 @@ CREATE TABLE signals (
     activity_id         VARCHAR(64) NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
     name                VARCHAR(128) NOT NULL,
     payload_json        JSONB,
+    dedupe_key          VARCHAR(128),               -- sender-supplied Idempotency-Key
     delivered           BOOLEAN NOT NULL DEFAULT FALSE,
     created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     delivered_at        TIMESTAMP WITH TIME ZONE
 );
 
 CREATE INDEX idx_signals_pending ON signals(activity_id, name) WHERE delivered = FALSE;
+
+-- a retried external send with the same key is one mailbox entry
+CREATE UNIQUE INDEX idx_signals_dedupe ON signals(activity_id, dedupe_key) WHERE dedupe_key IS NOT NULL;
 ```
 
-**Delivery semantics**: at-least-once with idempotent handlers (see ADR-005 open question). The `SignalBus` interface abstracts the substrate (Postgres LISTEN/NOTIFY or a dedicated table early; NATS JetStream later) without changing activity code.
+**Delivery semantics**: at-least-once with idempotent handlers (see ADR-005 open question), with sender-side dedupe at the door via `dedupe_key`. The `SignalBus` interface abstracts the substrate (Postgres-backed initially; an optional NATS JetStream substrate in Phase 7) without changing activity code.
+
+---
+
+### 5a. Pending Timers Table (Durable Sleep)
+
+**Purpose**: the coordinator's timer sweep. `ctx.Sleep(d)` records a call-log entry and a timer row; the sweep (poll every second on `wake_at`) completes the call and re-enqueues the activity.
+
+```sql
+CREATE TABLE pending_timers (
+    id                  BIGSERIAL PRIMARY KEY,
+    activity_id         VARCHAR(64) NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+    call_id             BIGINT NOT NULL REFERENCES activity_calls(id) ON DELETE CASCADE,
+    wake_at             TIMESTAMP WITH TIME ZONE NOT NULL,
+    fired_at            TIMESTAMP WITH TIME ZONE,
+    created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_pending_timers_due ON pending_timers(wake_at) WHERE fired_at IS NULL;
+```
 
 ---
 
@@ -299,8 +348,10 @@ CREATE INDEX idx_workers_heartbeat ON workers(last_heartbeat) WHERE status = 'HE
 **Example `capabilities`**:
 
 ```json
-{ "activity_types": ["run_ingestion_partition", "diagnose", "model_call"], "version": "1.2.3" }
+{ "activity_types": {"sample_pipeline": "1.2.3", "sample_leaf": "1.2.3"} }
 ```
+
+Capabilities map each activity type to the code **version** the worker runs — the basis for version-pinned replay (a suspended activity resumes only on a worker advertising its pinned version).
 
 ---
 
@@ -356,7 +407,7 @@ CREATE INDEX idx_audit_events_type     ON audit_events(event_type, timestamp DES
 - `activity.paused`, `activity.completed`, `activity.failed`, `activity.cancelled`, `activity.redistributed`
 - `worker.registered`, `worker.heartbeat_missed`, `worker.marked_dead`
 
-App-specific audit events (connector upgraded, remediation applied) are written by apps via the same table.
+Consumers may write their own domain audit events via the same table under their own `event_type` namespace. Operator recovery actions (`force-complete`, `truncate-replay`, drain) are always audited here.
 
 ---
 
@@ -388,103 +439,47 @@ RETURNING value;
 
 ---
 
-## Broker Message Formats
+## Control-Plane Message Formats
 
-### Message Envelope
+**There is no broker on the critical path** (ADR-002, revised). Coordinator↔worker communication is state-based: **the tables above are the messages**.
+
+| v1 "message" | v2 mechanism |
+|--------------|--------------|
+| Worker registration | Upsert into `workers` (capabilities = `{activity_type: version}`) |
+| Activity assignment | Worker **claims** a `PENDING` attempt via `FOR UPDATE SKIP LOCKED` — claiming the row is the assignment; there is no assign/ack protocol |
+| Worker heartbeat | Update `workers.last_heartbeat` + renew `activity_attempts.lease_expires_at` (generation-fenced) |
+| Progress / checkpoint | Insert into `checkpoints` (generation-fenced) |
+| Completion / failure | Conditional update on the attempt + activity rows (generation-fenced) |
+| Cancellation / pause | Coordinator flags the activity row; workers observe on heartbeat or notification |
+| Signal delivery | Insert into `signals`; coordinator delivers to the waiting call |
+
+### Notification Hints (LISTEN/NOTIFY)
+
+Notifications carry **hints, never state** — payloads are identifiers only, and a dropped notification costs at most one poll interval:
+
+| Topic | Payload | Woken party | Fallback |
+|-------|---------|-------------|----------|
+| `task_ready` | `activity_type` | Idle workers (claim loop) | 2s claim poll |
+| `signal_arrived` | `activity_id` | Coordinator signal delivery | wake sweep |
+| `control_changed` | `activity_id` | Worker running that activity | 30s heartbeat |
+
+### Optional Phase 7 Substrate Envelope
+
+If the JetStream `TaskQueue`/`SignalBus` substrates are adopted at scale, their wire format wraps the same identifiers-only philosophy; Postgres rows remain the source of truth:
 
 ```go
+// Used ONLY by the optional Phase 7 broker substrates.
 type Message struct {
-    MessageID     string                 `json:"message_id"`
-    Type          string                 `json:"type"`
-    Timestamp     time.Time              `json:"timestamp"`
-    SenderID      string                 `json:"sender_id"`
-    SenderType    string                 `json:"sender_type"` // "coordinator" or "worker"
-    CorrelationID string                 `json:"correlation_id,omitempty"`
-    Payload       map[string]interface{} `json:"payload"`
-}
-```
-
-### 1. Worker Registration — `worker.register` (Worker → Coordinator, `coordinator.events`)
-
-```go
-type WorkerRegistrationPayload struct {
-    WorkerID      string            `json:"worker_id"`
-    ActivityTypes []string          `json:"activity_types"`
-    CapacityTotal int               `json:"capacity_total"`
-    Tags          map[string]string `json:"tags"`
-    Version       string            `json:"version"`
-}
-```
-
-### 2. Activity Assignment — `activity.assign` (Coordinator → Worker, `worker.{id}.commands`)
-
-```go
-type ActivityAssignmentPayload struct {
-    ActivityID    string                 `json:"activity_id"`
-    ActivityType  string                 `json:"activity_type"`
-    InputJSON     map[string]interface{} `json:"input_json"`
-    Generation    int64                  `json:"generation"`
-    LeaseSeconds  int                    `json:"lease_seconds"`
-    AttemptNumber int                    `json:"attempt_number"`
+    MessageID     string    `json:"message_id"`
+    Type          string    `json:"type"`      // task_ready | signal_arrived | control_changed
+    Timestamp     time.Time `json:"timestamp"`
+    SenderID      string    `json:"sender_id"`
+    CorrelationID string    `json:"correlation_id,omitempty"`
+    RefID         string    `json:"ref_id"`    // activity_id / activity_type — a pointer, never a payload
 }
 ```
 
 > Secrets are never embedded in `input_json`; workers resolve secret references through approved providers.
-
-### 3. Heartbeat — `worker.heartbeat` (Worker → Coordinator, `worker.{id}.status`)
-
-```go
-type HeartbeatPayload struct {
-    WorkerID         string   `json:"worker_id"`
-    Status           string   `json:"status"`            // "HEALTHY" | "DRAINING"
-    CapacityUsed     int      `json:"capacity_used"`
-    CapacityTotal    int      `json:"capacity_total"`
-    RunningActivities []string `json:"running_activities"`
-}
-```
-
-### 4. Progress / Heartbeat State — `activity.progress` (Worker → Coordinator, `worker.{id}.status`)
-
-```go
-type ProgressUpdatePayload struct {
-    ActivityID    string `json:"activity_id"`
-    AttemptNumber int    `json:"attempt_number"`
-    CheckpointSeq int    `json:"checkpoint_sequence,omitempty"`
-    Message       string `json:"message,omitempty"`
-}
-```
-
-### 5. Child Dispatch / Completion — `activity.child_dispatch`, `activity.completed`, `activity.failed`
-
-```go
-type ActivityCompletionPayload struct {
-    ActivityID   string                 `json:"activity_id"`
-    AttemptNumber int                   `json:"attempt_number"`
-    Status       string                 `json:"status"`        // "COMPLETED" | "FAILED"
-    ResultJSON   map[string]interface{} `json:"result_json,omitempty"`
-    ErrorMessage string                 `json:"error_message,omitempty"`
-    ErrorType    string                 `json:"error_type,omitempty"` // "transient" | "permanent"
-}
-```
-
-### 6. Activity Cancellation — `activity.cancel` (Coordinator → Worker, `worker.{id}.commands`)
-
-```go
-type ActivityCancellationPayload struct {
-    ActivityID string `json:"activity_id"`
-    Reason     string `json:"reason"`
-}
-```
-
-### 7. Signal Delivery — `activity.signal` (Coordinator → Worker, or internal via SignalBus)
-
-```go
-type SignalPayload struct {
-    ActivityID string                 `json:"activity_id"`
-    Name       string                 `json:"name"`
-    Payload    map[string]interface{} `json:"payload,omitempty"`
-}
-```
 
 ---
 
@@ -510,6 +505,18 @@ const (
     ActivityStatusCompleted      ActivityStatus = "COMPLETED"
     ActivityStatusFailed         ActivityStatus = "FAILED"
     ActivityStatusCancelled      ActivityStatus = "CANCELLED"
+)
+
+// AttemptStatus is the physical-attempt lifecycle — distinct from ActivityStatus.
+type AttemptStatus string
+
+const (
+    AttemptStatusPending     AttemptStatus = "PENDING"
+    AttemptStatusRunning     AttemptStatus = "RUNNING"
+    AttemptStatusCompleted   AttemptStatus = "COMPLETED"
+    AttemptStatusFailed      AttemptStatus = "FAILED"
+    AttemptStatusInterrupted AttemptStatus = "INTERRUPTED"
+    AttemptStatusFenced      AttemptStatus = "FENCED"
 )
 
 type WorkerStatus string
@@ -556,8 +563,10 @@ type Activity struct {
     ResultJSON       json.RawMessage `json:"result_json,omitempty" db:"result_json"`
     ErrorJSON        json.RawMessage `json:"error_json,omitempty" db:"error_json"`
     RetryPolicyJSON  json.RawMessage `json:"retry_policy_json" db:"retry_policy_json"`
-    LeaseExpiresAt   *time.Time      `json:"lease_expires_at,omitempty" db:"lease_expires_at"`
     Generation       int64           `json:"generation" db:"generation"`
+    PinnedVersion    *string         `json:"pinned_version,omitempty" db:"pinned_version"`
+    ExecutionSeq     int             `json:"execution_seq" db:"execution_seq"`
+    SupersededBy     *string         `json:"superseded_by,omitempty" db:"superseded_by"`
     SuspendReason    *string         `json:"suspend_reason,omitempty" db:"suspend_reason"`
     WakeAt           *time.Time      `json:"wake_at,omitempty" db:"wake_at"`
     CreatedAt        time.Time       `json:"created_at" db:"created_at"`
@@ -567,23 +576,27 @@ type Activity struct {
     UpdatedAt        time.Time       `json:"updated_at" db:"updated_at"`
 }
 
-// ActivityAttempt is one physical execution attempt.
+// ActivityAttempt is one physical execution attempt. The lease lives here.
 type ActivityAttempt struct {
-    ID            int64           `json:"id" db:"id"`
-    ActivityID    string          `json:"activity_id" db:"activity_id"`
-    AttemptNumber int             `json:"attempt_number" db:"attempt_number"`
-    WorkerID      *string         `json:"worker_id,omitempty" db:"worker_id"`
-    Generation    int64           `json:"generation" db:"generation"`
-    Status        ActivityStatus  `json:"status" db:"status"`
-    ErrorJSON     json.RawMessage `json:"error_json,omitempty" db:"error_json"`
-    StartedAt     time.Time       `json:"started_at" db:"started_at"`
-    EndedAt       *time.Time      `json:"ended_at,omitempty" db:"ended_at"`
+    ID             int64           `json:"id" db:"id"`
+    ActivityID     string          `json:"activity_id" db:"activity_id"`
+    AttemptNumber  int             `json:"attempt_number" db:"attempt_number"`
+    ExecutionSeq   int             `json:"execution_seq" db:"execution_seq"`
+    WorkerID       *string         `json:"worker_id,omitempty" db:"worker_id"`
+    Generation     int64           `json:"generation" db:"generation"`
+    Status         AttemptStatus   `json:"status" db:"status"`
+    NotBefore      time.Time       `json:"not_before" db:"not_before"`
+    LeaseExpiresAt *time.Time      `json:"lease_expires_at,omitempty" db:"lease_expires_at"`
+    ErrorJSON      json.RawMessage `json:"error_json,omitempty" db:"error_json"`
+    StartedAt      *time.Time      `json:"started_at,omitempty" db:"started_at"`
+    EndedAt        *time.Time      `json:"ended_at,omitempty" db:"ended_at"`
 }
 
 // ActivityCall is one row in the durable call log used for replay.
 type ActivityCall struct {
     ID              int64           `json:"id" db:"id"`
     ActivityID      string          `json:"activity_id" db:"activity_id"`
+    ExecutionSeq    int             `json:"execution_seq" db:"execution_seq"`
     CallIndex       int             `json:"call_index" db:"call_index"`
     CallType        string          `json:"call_type" db:"call_type"` // run_child | sleep | await_signal
     ChildActivityID *string         `json:"child_activity_id,omitempty" db:"child_activity_id"`
@@ -599,6 +612,7 @@ type Signal struct {
     ID          int64           `json:"id" db:"id"`
     ActivityID  string          `json:"activity_id" db:"activity_id"`
     Name        string          `json:"name" db:"name"`
+    DedupeKey   *string         `json:"dedupe_key,omitempty" db:"dedupe_key"`
     PayloadJSON json.RawMessage `json:"payload_json,omitempty" db:"payload_json"`
     Delivered   bool            `json:"delivered" db:"delivered"`
     CreatedAt   time.Time       `json:"created_at" db:"created_at"`
@@ -718,7 +732,8 @@ func (c *Checkpoint) Validate() error {
 ## Indexing Strategy
 
 1. **Activity scheduling query** — `idx_activities_priority` (customer_id, status, priority DESC) for `PENDING` selection.
-2. **Lease expiration sweep** — `idx_activities_lease` finds expired `RUNNING` leases for redistribution.
+2. **Lease expiration sweep** — `idx_attempts_lease` finds expired `RUNNING` attempt leases for redistribution (the lease lives on the attempt).
+2a. **Dispatch claim** — `idx_attempts_pending` backs the workers' `FOR UPDATE SKIP LOCKED` claim query.
 3. **Wake sweep** — `idx_activities_wake` finds `SUSPENDED` activities whose `Sleep`/`AwaitSignal` timeout is due.
 4. **Replay lookup** — `idx_calls_activity` (activity_id, call_index) for the per-call log scan on resume.
 5. **Pending signal lookup** — `idx_signals_pending` for `AwaitSignal` delivery.
@@ -761,6 +776,8 @@ DELETE FROM workers WHERE status = 'DEAD' AND updated_at < NOW() - INTERVAL '7 d
 ## State Consistency Guarantees
 
 ### Transaction Boundaries
+
+**Fencing invariant (G3), applies to every transaction below**: no state-mutating write commits without a generation match — every worker-originated statement carries `WHERE … generation = $expected`; zero rows updated returns `ErrFenced` and the writer stops. This is enforced in the storage layer and covered by the shared contract-test suite.
 
 **Activity state transition** (atomic):
 
@@ -819,11 +836,11 @@ Use **golang-migrate** for versioned migrations. Conventions:
 
 | Migration | Phase | Introduces |
 |-----------|-------|-----------|
-| `001_core` | Platform Phase 1 | `customers`, `activities`, `activity_attempts`, `workers`, `checkpoints`, `audit_events` |
-| `002_call_log` | Platform Phase 3 | `activity_calls` + replay indexes |
-| `003_signals` | Platform Phase 4 | `signals` mailbox + pending index |
-| `004_coordinator_state` | Platform Phase 6 | `coordinator_state` (if Postgres-based leader election) |
-| app migrations | dataconnector P5 / llmops P1+ | app tables (`connector_*`, `llmops_*`) — owned by the app, never altering core tables |
+| `001_core` | Phase 1 | `customers`, `activities`, `activity_attempts` (own attempt-status enum), `workers`, `checkpoints` (attempt-scoped key), `audit_events` |
+| `002_call_log` | Phase 3 | `activity_calls` + replay indexes; `activities.pinned_version`, `execution_seq`, `superseded_by` |
+| `003_signals` | Phase 4 | `signals` mailbox + pending index + dedupe key; `pending_timers` |
+| `004_api_keys` | Phase 5 | `api_keys`, `idempotency_keys` retention |
+| `005_coordinator_state` | Phase 7 | `coordinator_state` (if Postgres-based leader election) |
 
 ```sql
 -- 001_core.up.sql
@@ -849,7 +866,7 @@ DROP TYPE IF EXISTS activity_status;
 COMMIT;
 ```
 
-**Rollback policy**: app tables are dropped before platform tables; never drop a core table while an app table references it. Breaking changes to the call-log or signal shape require a new migration plus a replay-compatibility note (see ADR-005 on checkpoint/state migration).
+**Rollback policy**: consumer-owned tables are dropped before platform tables; never drop a core table while an external table references it. Breaking changes to the call-log or signal shape require a new migration plus a replay-compatibility note (see ADR-005 on checkpoint/state migration).
 
 ---
 

@@ -1,10 +1,10 @@
 openapi: 3.1.0
 info:
   title: Niyanta Engine API
-  version: 2.0.0
+  version: 2.1.0
   description: >
-    The Niyanta platform (composable activity runner) API. Engine-only: activities,
-    workers, and health. App APIs (data connector, LLMOps) are separate documents.
+    The Niyanta platform (durable activity execution engine) API: activities,
+    workers, and health. The engine is use-case agnostic; activity payloads are opaque.
     Source of truth for engine request/response shapes; see docs/platform/API_SPEC.md.
 servers:
   - url: https://api.niyanta.example.com/v1
@@ -12,6 +12,7 @@ security:
   - apiKey: []
 tags:
   - name: activities
+  - name: recovery
   - name: customers
   - name: workers
   - name: health
@@ -62,8 +63,17 @@ paths:
   /activities/{activity_id}:
     get:
       tags: [activities]
-      summary: Get an activity
-      parameters: [ { $ref: '#/components/parameters/ActivityId' } ]
+      summary: Get an activity (optionally long-polling until terminal)
+      parameters:
+        - $ref: '#/components/parameters/ActivityId'
+        - name: wait
+          in: query
+          required: false
+          description: >
+            Long-poll window (e.g. "30s", max "60s"). Returns early when the
+            activity reaches a terminal state; otherwise returns current state
+            after the window.
+          schema: { type: string }
       responses:
         '200':
           description: OK
@@ -85,11 +95,31 @@ paths:
         '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Activity' } } } }
         '409': { $ref: '#/components/responses/Error' }
 
+  /activities/{activity_id}:pause:
+    post:
+      tags: [activities]
+      summary: Pause an activity at its next safe suspend point
+      parameters: [ { $ref: '#/components/parameters/ActivityId' } ]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Activity' } } } }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /activities/{activity_id}:resume:
+    post:
+      tags: [activities]
+      summary: Resume a paused activity
+      parameters: [ { $ref: '#/components/parameters/ActivityId' } ]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Activity' } } } }
+        '409': { $ref: '#/components/responses/Error' }
+
   /activities/{activity_id}:signal:
     post:
       tags: [activities]
       summary: Deliver an external signal to an activity
-      parameters: [ { $ref: '#/components/parameters/ActivityId' } ]
+      parameters:
+        - $ref: '#/components/parameters/ActivityId'
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -101,8 +131,63 @@ paths:
                 name: { type: string }
                 payload: { type: object, additionalProperties: true }
       responses:
-        '200': { description: OK }
+        '200': { description: OK (a retried send with the same Idempotency-Key is one mailbox entry) }
         '404': { $ref: '#/components/responses/Error' }
+
+  /activities/{activity_id}:force-fail:
+    post:
+      tags: [recovery]
+      summary: 'Operator recovery: force the activity to terminal FAILED (audited)'
+      parameters: [ { $ref: '#/components/parameters/ActivityId' } ]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { reason: { type: string } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Activity' } } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /activities/{activity_id}:force-complete:
+    post:
+      tags: [recovery]
+      summary: 'Operator recovery: force terminal COMPLETED with a supplied result (audited)'
+      parameters: [ { $ref: '#/components/parameters/ActivityId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [result_json]
+              properties:
+                result_json: { type: object, additionalProperties: true }
+                reason: { type: string }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Activity' } } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /activities/{activity_id}:truncate-replay:
+    post:
+      tags: [recovery]
+      summary: 'Operator recovery: drop the call-log suffix from a divergent index and re-enqueue (guarded, audited)'
+      parameters: [ { $ref: '#/components/parameters/ActivityId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from_call_index, confirm]
+              properties:
+                from_call_index: { type: integer }
+                confirm: { type: string, description: Confirmation token echoed from the error payload }
+                reason: { type: string }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Activity' } } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
 
   /activities/{activity_id}/attempts:
     get:
@@ -118,6 +203,59 @@ paths:
                 type: object
                 properties:
                   attempts: { type: array, items: { $ref: '#/components/schemas/ActivityAttempt' } }
+
+  /activities/{activity_id}/calls:
+    get:
+      tags: [activities]
+      summary: Get the call log for the current execution (replay history)
+      parameters: [ { $ref: '#/components/parameters/ActivityId' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  calls: { type: array, items: { $ref: '#/components/schemas/ActivityCall' } }
+
+  /activities/{activity_id}/signals:
+    get:
+      tags: [activities]
+      summary: Get the signal mailbox (pending and delivered)
+      parameters: [ { $ref: '#/components/parameters/ActivityId' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  signals: { type: array, items: { $ref: '#/components/schemas/Signal' } }
+
+  /activities/{activity_id}/executions:
+    get:
+      tags: [activities]
+      summary: Get the ContinueAsNew execution chain
+      parameters: [ { $ref: '#/components/parameters/ActivityId' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  executions: { type: array, items: { $ref: '#/components/schemas/Execution' } }
+
+  /activities/{activity_id}/audit:
+    get:
+      tags: [activities]
+      summary: Get the activity's audit events
+      parameters: [ { $ref: '#/components/parameters/ActivityId' } ]
+      responses:
+        '200': { description: OK }
 
   /customers/{customer_id}:
     get:
@@ -244,23 +382,60 @@ components:
         wake_at: { type: [string, 'null'], format: date-time }
         priority: { type: integer }
         worker_id: { type: [string, 'null'] }
+        pinned_version: { type: [string, 'null'], description: Code version this activity's replay is pinned to (set at first suspend) }
+        execution_seq: { type: integer, description: Current execution in the ContinueAsNew chain (starts at 1) }
         input_json: { type: object, additionalProperties: true }
         result_json: { type: [object, 'null'], additionalProperties: true }
-        error_json: { type: [object, 'null'], additionalProperties: true }
+        error_json: { type: [object, 'null'], additionalProperties: true, description: 'On nondeterminism: {type: "nondeterminism", call_index, confirm}' }
         current_attempt: { type: integer }
         generation: { type: integer, format: int64 }
         created_at: { type: string, format: date-time }
         started_at: { type: [string, 'null'], format: date-time }
         completed_at: { type: [string, 'null'], format: date-time }
+    AttemptStatus:
+      type: string
+      enum: [PENDING, RUNNING, COMPLETED, FAILED, INTERRUPTED, FENCED]
     ActivityAttempt:
       type: object
       properties:
         attempt_number: { type: integer }
         worker_id: { type: [string, 'null'] }
         generation: { type: integer, format: int64 }
-        status: { $ref: '#/components/schemas/ActivityStatus' }
+        status: { $ref: '#/components/schemas/AttemptStatus' }
+        lease_expires_at: { type: [string, 'null'], format: date-time }
         error: { type: [object, 'null'], additionalProperties: true }
         started_at: { type: string, format: date-time }
+        ended_at: { type: [string, 'null'], format: date-time }
+    ActivityCall:
+      type: object
+      properties:
+        call_index: { type: integer }
+        execution_seq: { type: integer }
+        call_type: { type: string, enum: [run_child, sleep, await_signal, _now, _id] }
+        args_hash: { type: [string, 'null'] }
+        child_activity_id: { type: [string, 'null'] }
+        completed: { type: boolean }
+        result_json: { type: [object, 'null'], additionalProperties: true }
+        created_at: { type: string, format: date-time }
+        completed_at: { type: [string, 'null'], format: date-time }
+    Signal:
+      type: object
+      properties:
+        name: { type: string }
+        payload_json: { type: [object, 'null'], additionalProperties: true }
+        dedupe_key: { type: [string, 'null'] }
+        delivered: { type: boolean }
+        created_at: { type: string, format: date-time }
+        delivered_at: { type: [string, 'null'], format: date-time }
+    Execution:
+      type: object
+      properties:
+        execution_seq: { type: integer }
+        status: { $ref: '#/components/schemas/ActivityStatus' }
+        input_json: { type: object, additionalProperties: true }
+        result_json: { type: [object, 'null'], additionalProperties: true }
+        call_count: { type: integer }
+        started_at: { type: [string, 'null'], format: date-time }
         ended_at: { type: [string, 'null'], format: date-time }
     Error:
       type: object

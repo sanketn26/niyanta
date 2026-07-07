@@ -1,6 +1,6 @@
-# Phase 4: Durable Timers, Deterministic Primitives, And Signals
+# Phase 4: Durable Timers, Deterministic Primitives, Signals, ContinueAsNew
 
-**Goal**: Activities can sleep without occupying workers, wake from external events, and replay deterministic values.
+**Goal**: Activities can sleep without occupying workers, wake from external events, replay deterministic values, and run for unbounded lifetimes with **bounded replay cost** (`ContinueAsNew`). Cancellation of suspended activities has defined semantics.
 
 ## Schema
 
@@ -23,6 +23,7 @@ CREATE TABLE signals (
     activity_id     TEXT NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
     name            TEXT NOT NULL,
     payload         JSONB NOT NULL DEFAULT '{}',
+    dedupe_key      TEXT,                          -- sender-supplied Idempotency-Key
     delivered_at    TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -30,6 +31,11 @@ CREATE TABLE signals (
 CREATE INDEX idx_signals_mailbox
     ON signals(activity_id, name, created_at)
     WHERE delivered_at IS NULL;
+
+-- a retried external send with the same key is one mailbox entry
+CREATE UNIQUE INDEX idx_signals_dedupe
+    ON signals(activity_id, dedupe_key)
+    WHERE dedupe_key IS NOT NULL;
 ```
 
 ## Deterministic `Now` And `NewID`
@@ -164,17 +170,53 @@ func (c *RuntimeContext) AwaitSignal(name string, timeout time.Duration) ([]byte
 }
 ```
 
+## Synthetic-Entry Batching
+
+`Now()`/`NewID()` record per call, but consecutive synthetic entries between real suspend points are buffered and flushed in one batch at the next durable write — a loop calling `Now()` must not issue one Postgres write per iteration.
+
+## ContinueAsNew (G5)
+
+The primitive that bounds replay history for unbounded-lifetime activities. Schema groundwork (`execution_seq`, `superseded_by`) landed in Phase 3.
+
+```go
+// Completes the current execution and atomically starts a successor with a
+// fresh call log. Never returns on success (the attempt ends).
+func (c *RuntimeContext) ContinueAsNew(input []byte) error
+```
+
+One transaction:
+
+1. Mark current execution `COMPLETED` with `result = {"continued_as_new": true}`.
+2. Increment `activities.execution_seq`; reset status to `PENDING` with the new input.
+3. Carry over **undelivered** signals (mailbox survives the boundary).
+4. Clear `pinned_version` — the successor may pin onto new code (the sanctioned upgrade point).
+
+Preserved across the boundary: `activity_id` (signals keep routing), parent/root composition links, the execution chain for audit (`execution_seq` on every call/attempt row). Replay always loads only the **current** execution's call log.
+
+## Cancellation Semantics
+
+`:cancel` on an activity:
+
+1. Cancel in-flight children depth-first (each child gets its own cancellation).
+2. Re-dispatch a suspended parent once: its pending suspend-point call (`RunChild`/`Sleep`/`AwaitSignal`) returns `ErrCancelled`, giving the body one bounded chance to finish cleanup **using already-recorded state only** — new dispatches after cancellation are rejected.
+3. Transition to `CANCELLED`; record child accounting in `result`.
+
 ## Acceptance Tests
 
 1. `Sleep(48h)` creates a timer and frees the worker.
 2. Fast-forward timer wakes the activity and resumes execution.
 3. Signal sent before `AwaitSignal` is not lost.
 4. Signal sent while no worker owns the activity wakes it.
-5. `Now` and `NewID` replay the same values.
+5. `Now` and `NewID` replay the same values; a 1,000-iteration `Now()` loop produces O(suspend points) writes, not O(iterations).
+6. Duplicate signal send with the same `Idempotency-Key` → one mailbox entry.
+7. **ContinueAsNew**: an activity with 500 logged calls continues-as-new; the successor's first resume replays ~0 entries; signals to the same ID still arrive; the execution chain links both.
+8. Cancel a parent suspended on `AwaitSignal` with one running child → child cancelled, parent's call site returns `ErrCancelled`, no new dispatches, terminal `CANCELLED`.
 
 ## Done When
 
 - Long waits cost no worker capacity.
-- Signals are durable.
+- Signals are durable and dedupe-able at the door.
 - Replay is deterministic across suspend points.
+- Replay cost is bounded by the current execution's call count, regardless of activity lifetime.
+- Cancellation leaves no orphaned children.
 

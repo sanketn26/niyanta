@@ -22,7 +22,7 @@
 
 Niyanta is an **idiomatic, composable activity runner that provides execution guarantees**. That is the product. An *activity* is a unit of work; activities compose (a parent activity can invoke optional child activities); and Niyanta guarantees how that composition runs: it survives crashes, resumes where it left off, retries on failure, runs activities in parallel across a worker fleet, coordinates them, and isolates them by tenant.
 
-Everything else — connectors, ingestion planners, diagnosis loops, remediation — is **not the platform**. Those are *compositions of activities* that people build on Niyanta. The platform does not know what an activity "means"; it knows how to run it durably.
+Everything else — any domain product, pipeline, or control loop — is **not the platform**. Those are *compositions of activities* that consumers build on Niyanta. The platform does not know what an activity "means"; it knows how to run it durably.
 
 Niyanta provides:
 
@@ -35,33 +35,11 @@ Niyanta provides:
 
 The rest is plumbing.
 
-### Activity Compositions Built On Niyanta
-
-The platform is application-agnostic. Specific products are described as **activity compositions** ("cookbooks") that wire activities together and lean on the guarantees above. They are not a special platform layer — there is no app SPI or app runtime, only activities. The current compositions:
-
-- **Data Connector** — self-orchestrated, multi-tenant data ingestion. Supervisor → plan → partition-run → deliver, expressed as composed activities. See [../apps/dataconnector/INGESTION_ARCHITECTURE.md](../apps/dataconnector/INGESTION_ARCHITECTURE.md).
-- **LLMOps for Data Connectors** — uses LLMs to detect issues, diagnose lag/failures, and operationalize connectors. Sweep → diagnose → (tool lookups) → remediate → verify, expressed as composed activities that call the Data Connector control API. See [../apps/llmops/ARCHITECTURE.md](../apps/llmops/ARCHITECTURE.md).
-
-New compositions add their own activity types and their own state without changing the engine. The platform sections below describe the runner; the app docs describe what gets composed on it.
-
-**A composition can itself be a platform — and the engine does not change to allow it.** A layer may expose a higher-level interface that hides the activities beneath it, but doing so is entirely that layer's own responsibility: its own config language, its own parser, its own state, its own API, all built on the unchanged platform primitives. Niyanta does not grow features to "enable" apps-as-platforms; it stays a plain activity runner. The Data Connector composition offers a declarative **connector config language** (YAML connector definitions and connections) — that language, its validation, and its storage live in the Data Connector composition, not in the engine. A connector author writes YAML and never sees an activity, even though every connector run *is* an activity composition underneath. LLMOps may similarly expose a playbook/policy language over its diagnosis and remediation activities, again owned by LLMOps, not the platform. So the stack is recursive:
-
-```
-Niyanta              composable activity runner + execution guarantees
-  └─ Data Connector  activity composition that also exposes a YAML connector language
-       └─ connector authors write declarative YAML, never touch activities
-  └─ LLMOps          activity composition that may expose a playbook/policy language
-```
-
-Each layer is "just activities composed beneath a chosen interface." Niyanta does not need to know a layer above it exists; a layer above does not need to know it is activities all the way down. Crucially, the platform carries none of this layering itself — owning the higher-level interface is the app's burden, by design. This is what keeps the engine small and every composition independent.
-
 ### What Is And Is Not Niyanta's Concern
 
 Niyanta's concern is exactly one thing: **run an activity, give it execution guarantees, and hold enough state to resume it if it gets stuck or its worker crashes.** That is the whole contract — runtime, guarantees, state for resume, coordination, isolation. Niyanta is agnostic to *what* an activity does and to *what config drove it*.
 
-In particular, the **connector YAML language and the LLMOps runbook/policy languages are not Niyanta configuration.** Niyanta neither defines, parses, validates, nor stores them as platform config. They are each composition's own config, interpreted by that composition's own activities. Niyanta only ever sees "an activity is running; here is its durable state; resume it if needed" — it does not see a connector definition or a runbook. A connector definition is meaningful to the Data Connector composition's activities; a runbook is meaningful to the LLMOps composition's activities; both are opaque payloads to the engine.
-
-This separation is what lets compositions evolve their config languages freely (add a connector kind, add a runbook field) without any platform change — because the platform was never looking.
+Anything built on the engine — any product that wires activity types together, possibly under its own higher-level interface or config language — is a **consumer** of this contract, not part of it. Such a layer owns its own config, parser, state, and API, all built on unchanged platform primitives; to the engine, that layer's config is an opaque payload inside an activity's `input_json`. Niyanta does not grow features to "enable" layers above it, does not know they exist, and never parses their configuration. This is what keeps the engine small and lets consumers evolve freely without any platform change — the platform was never looking.
 
 ---
 
@@ -69,7 +47,7 @@ This separation is what lets compositions evolve their config languages freely (
 
 ### High-Level Architecture
 
-This is the **engine**. It runs activities; apps register activity types and submit work. Nothing below is connector- or LLM-specific.
+This is the **engine**. It runs activities; consumers register activity types and submit work. Nothing below is specific to any domain.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -97,10 +75,10 @@ This is the **engine**. It runs activities; apps register activity types and sub
                │               │               │
                ▼               ▼               ▼
        ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-       │ Broker       │ │ State Store  │ │ Observability│
-       │ NATS/        │ │ Postgres     │ │ Metrics/Logs │
-       │ JetStream    │ │ + optional   │ │ Traces       │
-       │              │ │ etcd         │ │              │
+       │ Dispatch     │ │ State Store  │ │ Observability│
+       │ Postgres     │ │ Postgres     │ │ Metrics/Logs │
+       │ SKIP LOCKED  │ │ + optional   │ │ Traces       │
+       │ + NOTIFY     │ │ etcd         │ │ (console)    │
        └──────┬───────┘ └──────┬───────┘ └──────────────┘
               │                │
               ▼                ▼
@@ -114,7 +92,7 @@ This is the **engine**. It runs activities; apps register activity types and sub
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-> What runs *inside* an activity — connector source reads, transforms, destination delivery, LLM calls — is the app's concern. The engine sees only "activity of type X with opaque input, running on worker W." The Data Connector worker runtime (HTTP poll, object reader, stream listener, sinks) is documented in [../apps/dataconnector/INGESTION_ARCHITECTURE.md](../apps/dataconnector/INGESTION_ARCHITECTURE.md).
+> What runs *inside* an activity is the consumer's code. The engine sees only "activity of type X with opaque input, running on worker W."
 
 ### Core Components
 
@@ -123,10 +101,10 @@ This is the **engine**. It runs activities; apps register activity types and sub
 | Coordinator | 3+ (HA) | API, activity scheduling, timers/signals, lifecycle management | No |
 | Worker | N (horizontal) | Execute any registered activity type; dispatch children; heartbeat | No |
 | State Storage | 1 cluster | Activities, attempts, call log, signals, checkpoints, audit | Yes |
-| Broker | 1 cluster | Coordinator↔worker control plane; optional durable signal substrate | Optional |
+| Broker (optional, Phase 7) | 1 cluster | Drop-in `TaskQueue`/`SignalBus` substrate at scale; not on the critical path | Optional |
 | Observability Store | 1+ | Metrics, logs, traces | Yes |
 
-App-specific control-plane components (the Data Connector's connector registry, connection manager, and ingestion planner; the LLMOps sweep/diagnosis loops) are **not** engine components — they are activity compositions and their own state, layered on the above. See [../apps/dataconnector/INGESTION_ARCHITECTURE.md](../apps/dataconnector/INGESTION_ARCHITECTURE.md) and [../apps/llmops/ARCHITECTURE.md](../apps/llmops/ARCHITECTURE.md).
+Domain-specific control planes built by consumers are **not** engine components — they are activity compositions plus their own state, layered on the above and documented wherever those products live.
 
 ---
 
@@ -139,11 +117,11 @@ App-specific control-plane components (the Data Connector's connector registry, 
 - Schedule activity attempts to workers by activity-type capability, affinity, capacity, tenant quota, and SLA priority
 - Drive durable timers (`Sleep`) and deliver signals (`AwaitSignal`) to suspended activities
 - Record the call log and re-dispatch parents for replay-based resume after a child completes
-- Monitor worker health via broker heartbeats; detect failure and trigger redistribution with fencing
+- Monitor worker health via heartbeat rows in the state store; detect failure and trigger redistribution with fencing
 - Manage activity lifecycle (schedule, suspend, resume, pause, cancel, complete)
 - Expose metrics and health endpoints
 
-The coordinator does **not** validate connector config, plan ingestion runs, or evaluate source/destination health — those are app activities. It schedules and resumes activities; the activities decide what to do.
+The coordinator does **not** interpret activity payloads or make domain decisions — it schedules and resumes activities; the activities decide what to do.
 
 **Internal Modules**:
 
@@ -187,7 +165,7 @@ The coordinator does **not** validate connector config, plan ingestion runs, or 
 - Single scheduler loop for activity attempts (leader only in HA setup)
 - Timer wheel + signal listener (leader only)
 - Per-worker health monitor (one goroutine per worker)
-- Event processor for broker messages (worker pool)
+- `LISTEN` connection + event processor for control-plane notifications (worker pool)
 
 **Leader Election** (HA Mode):
 - Use etcd or Postgres advisory locks for leader election
@@ -200,14 +178,14 @@ The coordinator does **not** validate connector config, plan ingestion runs, or 
 ### 2. Worker
 
 **Responsibilities** (engine-only):
-- Register with coordinator on boot and advertise the **activity types** it can execute
-- Listen for activity assignments on the broker
+- Register in the state store on boot and advertise the **activity types** (with versions) it can execute
+- Claim activity attempts from the state store (`FOR UPDATE SKIP LOCKED` pull, woken by `LISTEN/NOTIFY`)
 - Execute the activity body with resource isolation and context cancellation
 - Dispatch children (`RunChild`), persist heartbeat state (`Heartbeat`), and surface deterministic primitives (`Now`, `NewID`, `Sleep`, `AwaitSignal`) via `ActivityContext`
 - Report attempt progress and send heartbeats to the coordinator
 - Handle graceful shutdown (drain in-flight work)
 
-What an activity does internally (resolve secrets, read a source, call an LLM) is the app's code running on the worker; the engine provides the runtime and the context, not the app logic.
+What an activity does internally is the consumer's code running on the worker; the engine provides the runtime and the context, not the business logic.
 
 **Internal Modules**:
 
@@ -216,9 +194,9 @@ What an activity does internally (resolve secrets, read a source, call an LLM) i
 │              Worker Process                          │
 │                                                      │
 │  ┌────────────────┐  ┌─────────────────┐           │
-│  │ Control Plane  │  │  Registration   │           │
-│  │  Listener      │  │   Service       │           │
-│  │  (Broker Sub)  │  │  (activity types)│          │
+│  │ Claim Loop     │  │  Registration   │           │
+│  │ (SKIP LOCKED + │  │   Service       │           │
+│  │  LISTEN wakeup)│  │ (types+versions)│           │
 │  └───────┬────────┘  └────────┬────────┘           │
 │          │                     │                    │
 │          ▼                     ▼                    │
@@ -286,7 +264,7 @@ There is no `Init`/`Checkpoint`/`Close`: framework-managed retries replace manua
 - **PostgreSQL**: Primary data store (activity state, attempts, call log, signals, checkpoints, audit). Apps add their own tables here.
 - **etcd**: Leader election and watches (optional, if not using Postgres)
 
-**Schema Design**: See [DATA_MODELS.md](DATA_MODELS.md). App tables (connector_*, llmops_*) live in the same Postgres but are owned by their apps and never alter core tables.
+**Schema Design**: See [DATA_MODELS.md](DATA_MODELS.md). Consumers may add their own tables in the same Postgres, but they never alter core engine tables.
 
 **Consistency Model**:
 - Strong consistency for activity state transitions and call-log writes (transactions)
@@ -300,132 +278,96 @@ There is no `Init`/`Checkpoint`/`Close`: framework-managed retries replace manua
 
 ---
 
-### 4. Broker
+### 4. Control-Plane Communication (Dispatch)
 
-**Technology Selection**: **NATS**
+**Technology Selection**: **Postgres-native dispatch** — no broker on the critical path.
 
-**Rationale**:
-- Lightweight, minimal dependencies
-- Native request-reply pattern (for bidirectional communication)
-- Subject-based routing (per-worker channels)
-- At-least-once delivery with acknowledgments
-- Clustering for HA
+**Rationale** (minimal external dependencies):
+- Workers **pull** runnable attempts with `SELECT … FOR UPDATE SKIP LOCKED`, filtered by their advertised activity types — safe concurrent claiming with no extra infrastructure.
+- `LISTEN/NOTIFY` wakes idle workers so dispatch latency is not bounded by the poll interval; the poll loop remains as fallback, so a dropped notification costs latency, never correctness.
+- Registration, heartbeats, and completions are rows in the state store — one source of truth, no state/broker reconciliation problem.
 
-**Alternative**: Redis Streams (if Redis already in infrastructure)
+**Optional broker (Phase 7)**: NATS JetStream implementations of the `TaskQueue` and `SignalBus` interfaces exist as drop-in substitutes if measured Postgres dispatch throughput demands them. Adopting them is a configuration change, not an activity-code change.
 
-**Message Channels**:
-
-| Channel Pattern | Direction | Purpose |
-|----------------|-----------|---------|
-| `coordinator.broadcast` | Coordinator → All Workers | System-wide announcements |
-| `worker.{worker_id}.commands` | Coordinator → Specific Worker | Activity assignments, cancel |
-| `worker.{worker_id}.status` | Worker → Coordinator | Heartbeats, progress |
-| `coordinator.events` | Worker → Coordinator | Registration, completion |
-
-**Message Durability**:
-- No persistence required (ephemeral control plane)
-- If worker misses message, coordinator will retry based on state storage
-- Broker downtime handling: Coordinators and workers reconnect automatically
+**Durability model**:
+- Notifications are hints only; Postgres rows are the source of truth.
+- A worker that misses a notification claims the work on its next poll tick.
 
 ---
 
 ## Data Flow
 
-These are **engine** flows — submission, composition/replay, checkpoint, and redistribution of activities. App-level flows (e.g. the Data Connector's self-orchestrated ingestion loop, where a connection produces ongoing runs) are built from these and documented in [../apps/dataconnector/INGESTION_ARCHITECTURE.md](../apps/dataconnector/INGESTION_ARCHITECTURE.md) §Data Flow.
+These are **engine** flows — submission, composition/replay, checkpoint, and redistribution of activities. Anything domain-shaped is built from these primitives by consumers.
 
-### Activity Submission Flow
+### Activity Submission Flow (pull-based dispatch)
 
 ```
-Client                Coordinator          State Store         Broker              Worker
-  │                       │                     │                 │                   │
-  │  POST /activity       │                     │                 │                   │
-  ├──────────────────────>│                     │                 │                   │
-  │                       │                     │                 │                   │
-  │                       │ Validate & Create   │                 │                   │
-  │                       │ (status: PENDING)   │                 │                   │
-  │                       ├────────────────────>│                 │                   │
-  │                       │                     │                 │                   │
-  │                       │<────────────────────┤                 │                   │
-  │  202 Accepted         │                     │                 │                   │
-  │<──────────────────────┤                     │                 │                   │
-  │  (activity_id)        │                     │                 │                   │
-  │                       │                     │                 │                   │
-  │                       │ Scheduler selects   │                 │                   │
-  │                       │ target worker       │                 │                   │
-  │                       │                     │                 │                   │
-  │                       │ Update state        │                 │                   │
-  │                       │ (status: SCHEDULED) │                 │                   │
-  │                       ├────────────────────>│                 │                   │
-  │                       │                     │                 │                   │
-  │                       │ Send assignment     │                 │                   │
-  │                       ├─────────────────────┼────────────────>│                   │
-  │                       │                     │                 │                   │
-  │                       │                     │                 │  Start activity   │
-  │                       │                     │                 ├──────────────────>│
-  │                       │                     │                 │                   │
-  │                       │                     │                 │  Ack              │
-  │                       │<────────────────────┼─────────────────┤                   │
-  │                       │                     │                 │                   │
-  │                       │ Update state        │                 │                   │
-  │                       │ (status: RUNNING)   │                 │                   │
-  │                       ├────────────────────>│                 │                   │
+Client                Coordinator             State Store (Postgres)        Worker
+  │                       │                          │                        │
+  │  POST /activities     │                          │                        │
+  ├──────────────────────>│                          │                        │
+  │                       │ Validate & create        │                        │
+  │                       │ activity + attempt       │                        │
+  │                       │ (status: PENDING)        │                        │
+  │                       ├─────────────────────────>│                        │
+  │  202 Accepted         │                          │                        │
+  │<──────────────────────┤   NOTIFY task_ready      │                        │
+  │  (activity_id)        ├─────────────────────────>│ ── notification ──────>│
+  │                       │                          │                        │
+  │                       │                          │  Claim attempt         │
+  │                       │                          │  (FOR UPDATE SKIP      │
+  │                       │                          │   LOCKED, capability + │
+  │                       │                          │   affinity + version   │
+  │                       │                          │   predicates)          │
+  │                       │                          │<───────────────────────┤
+  │                       │                          │  status: RUNNING,      │
+  │                       │                          │  lease set, worker_id  │
+  │                       │                          │───────────────────────>│
+  │                       │                          │                        │
+  │                       │                          │      (executes)        │
 ```
+
+> No push, no ack protocol: claiming the row *is* the assignment. A worker that misses the `NOTIFY` claims on its next poll tick (2s fallback).
 
 ### Checkpoint & Progress Flow
 
 ```
-Worker              Broker            Coordinator       State Store
-  │                   │                    │                 │
-  │ (activity runs)   │                    │                 │
-  │                   │                    │                 │
-  │ Create checkpoint │                    │                 │
-  │                   │                    │                 │
-  │ Publish progress  │                    │                 │
-  ├──────────────────>│                    │                 │
-  │                   │  Forward           │                 │
-  │                   ├───────────────────>│                 │
-  │                   │                    │                 │
-  │                   │                    │ Store checkpoint│
-  │                   │                    ├────────────────>│
-  │                   │                    │                 │
-  │                   │                    │ Update metrics  │
-  │                   │                    ├────────────────>│
+Worker                      State Store (Postgres)          Coordinator
+  │                                │                             │
+  │ (activity runs)                │                             │
+  │                                │                             │
+  │ Heartbeat: renew lease,        │                             │
+  │ write checkpoint row           │                             │
+  │ (WHERE generation = $expected) │                             │
+  ├───────────────────────────────>│                             │
+  │                                │   Health monitor reads      │
+  │                                │   worker/lease freshness    │
+  │                                │<────────────────────────────┤
 ```
 
 ### Failure & Redistribution Flow
 
 ```
-Worker A            Broker         Coordinator        State Store       Worker B
-  │                   │                 │                  │                │
-  │ (stops sending    │                 │                  │                │
-  │  heartbeats)      │                 │                  │                │
-  │                   │                 │ Detect timeout   │                │
-  │                   │                 │ (30s missed)     │                │
-  │                   │                 │                  │                │
-  │                   │                 │ Mark worker DEAD │                │
-  │                   │                 ├─────────────────>│                │
-  │                   │                 │                  │                │
-  │                   │                 │ Get assigned     │                │
-  │                   │                 │ activities       │                │
-  │                   │                 │<─────────────────┤                │
-  │                   │                 │                  │                │
-  │                   │                 │ Update status:   │                │
-  │                   │                 │ REDISTRIBUTING   │                │
-  │                   │                 ├─────────────────>│                │
-  │                   │                 │                  │                │
-  │                   │                 │ Find new worker  │                │
-  │                   │                 │ (Worker B)       │                │
-  │                   │                 │                  │                │
-  │                   │                 │ Assign activity  │                │
-  │                   │                 ├─────────────────────────────────>│
-  │                   │                 │                  │                │
-  │                   │                 │                  │   Load last    │
-  │                   │                 │                  │<───checkpoint──┤
-  │                   │                 │                  │                │
-  │                   │                 │                  │   Resume exec  │
-  │                   │                 │<─────────────────┼────────────────┤
-  │                   │                 │ Update: RUNNING  │                │
-  │                   │                 ├─────────────────>│                │
+Worker A               Coordinator          State Store (Postgres)       Worker B
+  │                        │                       │                        │
+  │ (stops heartbeating)   │                       │                        │
+  │                        │ Detect stale          │                        │
+  │                        │ heartbeat/lease (60s) │                        │
+  │                        ├──────────────────────>│                        │
+  │                        │ Mark worker DEAD;     │                        │
+  │                        │ attempts INTERRUPTED; │                        │
+  │                        │ bump generation;      │                        │
+  │                        │ enqueue new attempts; │                        │
+  │                        │ NOTIFY task_ready     │                        │
+  │                        ├──────────────────────>│ ── notification ──────>│
+  │                        │                       │   Claim attempt        │
+  │                        │                       │<───────────────────────┤
+  │                        │                       │   Load checkpoint /    │
+  │                        │                       │   call log, resume     │
+  │                        │                       │───────────────────────>│
+  │ (wakes up later)       │                       │                        │
+  │ write with old         │                       │                        │
+  │ generation ──ErrFenced─┼──────────────────────>│ ✗ zero rows updated    │
 ```
 
 ---
@@ -436,35 +378,36 @@ Worker A            Broker         Coordinator        State Store       Worker B
 
 ```
                            ┌─────────────┐
-                           │   PENDING   │ (Initial state)
+                           │   PENDING   │ (initial; also after resume/wake)
                            └──────┬──────┘
-                                  │
-                                  │ Scheduler assigns
+                                  │ Scheduler admits
                                   ▼
                            ┌─────────────┐
-                    ┌─────>│  SCHEDULED  │
-                    │      └──────┬──────┘
-                    │             │
-                    │             │ Worker accepts
-                    │             ▼
-                    │      ┌─────────────┐
-                    │      │   RUNNING   │<────┐
-                    │      └──────┬──────┘     │
-                    │             │            │ Resume
-                    │             │            │
-       Cancel       │       ┌─────┴──────┬─────────────┐
-       ┌────────────┘       │            │             │
-       │              Complete      Pause/Error    Failure
-       │                    │            │             │
-       ▼                    ▼            ▼             ▼
-┌─────────────┐      ┌─────────────┐ ┌──────────┐ ┌──────────────┐
-│  CANCELLED  │      │  COMPLETED  │ │  PAUSED  │ │REDISTRIBUTING│
-└─────────────┘      └─────────────┘ └────┬─────┘ └──────┬───────┘
-                                           │               │
-                                           └───────────────┘
-                                                   │
-                                                Resume on
-                                               another worker
+                    ┌─────>│  SCHEDULED  │<───────────────────────┐
+                    │      └──────┬──────┘                        │
+                    │             │ Worker claims                 │
+                    │             ▼                               │
+                    │      ┌─────────────┐   RunChild/Sleep/      │
+                    │      │   RUNNING   │──AwaitSignal──┐        │
+                    │      └──┬───┬───┬──┘               ▼        │
+                    │         │   │   │           ┌───────────┐   │
+       Cancel       │         │   │   │           │ SUSPENDED │───┘
+   (any non-        │         │   │   │           └───────────┘ child done /
+    terminal state) │         │   │   │            holds no      timer fired /
+       ┌────────────┘         │   │   │            worker slot   signal arrived
+       │             Complete │   │   │ Retries exhausted or
+       │              ┌───────┘   │   │ nondeterminism (no auto-retry)
+       │              │     Pause │   └──────────────┐
+       │              │           │                  │
+       │              │           │      Worker died / lease expired
+       │              │           │                  │
+       ▼              ▼           ▼                  ▼
+┌─────────────┐ ┌───────────┐ ┌────────┐   ┌──────────────┐   ┌────────┐
+│  CANCELLED  │ │ COMPLETED │ │ PAUSED │   │REDISTRIBUTING│   │ FAILED │
+└─────────────┘ └───────────┘ └───┬────┘   └──────┬───────┘   └────────┘
+                                  │ Resume        │ New attempt,
+                                  └───────────────┴─> bumped generation,
+                                                      back to SCHEDULED
 ```
 
 ### State Invariants
@@ -478,28 +421,28 @@ Worker A            Broker         Coordinator        State Store       Worker B
 
 ## Communication Patterns
 
-### 1. Request-Reply (Synchronous)
-**Use Case**: Coordinator → Worker commands that need acknowledgment
-- Assign activity
-- Cancel activity
-- Request capacity report
+All coordinator↔worker communication is **state-based with notification hints** — Postgres rows are the messages; `LISTEN/NOTIFY` only reduces latency.
 
-**Timeout**: 10 seconds
-**Retry**: 3 attempts with exponential backoff
-
-### 2. Publish-Subscribe (Asynchronous)
-**Use Case**: Worker → Coordinator status updates
-- Heartbeats (every 30s)
-- Progress reports (on checkpoint, or every 5 minutes)
-- Completion notifications
-
-**Delivery Guarantee**: At-least-once
-
-### 3. State-Based (Via State Storage)
-**Use Case**: Cross-component coordination
-- Scheduler queries pending activity attempts from state storage
-- Worker reads activity input and call log from state storage
+### 1. State-Based (Via State Storage) — the primary pattern
+**Use Case**: Everything that must be correct
+- Dispatch: workers claim `PENDING` attempts (`FOR UPDATE SKIP LOCKED`, filtered by capability/version/affinity) — claiming the row *is* the assignment
+- Completion/failure: workers write results with generation-fenced conditional updates
+- Heartbeats (every 30s): workers renew `last_heartbeat` and attempt leases
+- Cancellation/pause: coordinator flags the row; workers observe on heartbeat or via notification
 - Audit trail writes
+
+**Delivery Guarantee**: transactional — the write either committed or it didn't; no message/state reconciliation problem.
+
+### 2. Notification Hints (LISTEN/NOTIFY)
+**Use Case**: Latency only — never correctness
+- `task_ready` wakes idle workers to claim immediately
+- `signal_arrived` wakes the coordinator's signal delivery
+- `control_changed` prompts workers to re-read cancellation/pause flags
+
+A dropped notification costs at most one poll interval (2s dispatch, 30s control), never a lost operation.
+
+### 3. Optional Broker Substrate (Phase 7)
+If JetStream `TaskQueue`/`SignalBus` implementations are adopted at scale, they replace pattern 2's transport behind the same interfaces; pattern 1 remains the source of truth.
 
 ---
 
@@ -536,8 +479,6 @@ spec:
             secretKeyRef:
               name: niyanta-secrets
               key: postgres-url
-        - name: NATS_URL
-          value: "nats://nats-service:4222"
 
 ---
 # Worker Deployment (Horizontal autoscaling)
@@ -603,9 +544,9 @@ spec:
 - Instance: db.m5.large (start), scale up as needed
 - Read replicas for query offloading (optional)
 
-**Broker (NATS)**:
-- Clustered deployment (3 nodes)
-- Instance Type: t3.small (sufficient for control plane traffic)
+**Broker (optional, Phase 7 only)**:
+- Only deployed if JetStream substrates are adopted at scale; not part of the baseline footprint
+- Clustered deployment (3 nodes), t3.small sufficient for control-plane traffic
 
 ---
 
@@ -686,23 +627,26 @@ spec:
 
 **Kubernetes**:
 - NetworkPolicies to isolate:
-  - Coordinators can reach: State storage, broker, workers
-  - Workers can reach: Broker, state storage (read-only)
-  - External clients can reach: Coordinator API only
+  - Coordinators can reach: State storage
+  - Workers can reach: State storage (their scoped role), plus whatever egress their activity types need
+  - Console can reach: Coordinator API, plus coordinator/worker `/metrics` (scrape)
+  - External clients can reach: Coordinator API and console only
+  - (Phase 7 only, if adopted) broker reachable from coordinator/worker
 
 **EC2**:
 - Security Groups:
-  - Coordinator: Inbound 443/8080 (API), Outbound all
-  - Worker: Inbound from coordinator only, Outbound all
+  - Coordinator: Inbound 443/8080 (API) + `/metrics` from console, Outbound all
+  - Worker: Inbound `/metrics` from console only, Outbound all
   - State storage: Inbound 5432/2379 from coordinator/worker, no public access
-  - Broker: Inbound 4222 from coordinator/worker
+  - Console: Inbound 443 (UI), Outbound to coordinator/workers/state
+  - (Phase 7 only, if adopted) Broker: Inbound 4222 from coordinator/worker
 
 ### Secrets Management
 
 **Configuration**:
 - Database credentials: Kubernetes Secrets / AWS Secrets Manager
-- Broker credentials: Same as above
-- Connector secrets: Stored as secret references and resolved inside approved worker runtimes
+- Broker credentials (Phase 7 only, if adopted): Same as above
+- Activity secrets: passed as secret references in `input_json` (never values) and resolved inside approved worker runtimes
 
 **Encryption**:
 - Data in transit: TLS 1.3 for all component communication
@@ -718,12 +662,12 @@ spec:
 |-----------|---------------|-------------|-------|
 | Coordinator | CPU > 70% | 10 instances | Stateless, unlimited in theory |
 | Worker | Queue depth > 100 | 500 instances | Depends on activity-type resource needs |
-| State Storage | Connections, IOPS | 1 primary + replicas | Vertical scaling needed |
-| Broker | Message throughput | 3-node cluster sufficient | Very lightweight |
+| State Storage | Transitions/sec, connections, IOPS | 1 primary + replicas | The engine's scaling unit; also carries dispatch |
+| Broker (optional, Phase 7) | Message throughput | 3-node cluster sufficient | Only if JetStream substrates adopted |
 
 ### Deployment Density And Isolation
 
-Niyanta is designed for dense shared deployments by default. A regional deployment should host many tenants and many activity types while enforcing tenant isolation at the storage, scheduling, secret, network, and observability layers. (Apps add their own density dimensions — the Data Connector counts connector connections; see [../apps/dataconnector/INGESTION_ARCHITECTURE.md](../apps/dataconnector/INGESTION_ARCHITECTURE.md) §Multi-Tenancy.)
+Niyanta is designed for dense shared deployments by default. A regional deployment should host many tenants and many activity types while enforcing tenant isolation at the storage, scheduling, secret, network, and observability layers.
 
 Isolation modes:
 
@@ -750,8 +694,6 @@ Isolation requirements:
 - API rate limits: 10 submissions/second
 - Isolation mode: shared by default, pooled/dedicated by policy
 
-Apps layer their own limits on top (e.g. max connector connections per tier).
-
 **System-Wide Limits** (initial):
 - Total customers: 1000
 - Total concurrent activity attempts: 10,000
@@ -770,7 +712,7 @@ Apps layer their own limits on top (e.g. max connector connections per tier).
 | Redistribution time | < 2 minutes | From failure to reassignment |
 | Checkpoint commit latency | p95 < 1s | Heartbeat persist |
 
-App-level SLOs (connection planner latency, source lag) are defined in the app docs.
+> The meaningful load unit for capacity planning is **state transitions/sec** (each suspend point is several transactions), not concurrent-activity count. The engine's transition-throughput envelope is published as part of its contract (Phase 7 load tests).
 
 ---
 
@@ -778,7 +720,7 @@ App-level SLOs (connection planner latency, source lag) are defined in the app d
 
 ### Key Metrics
 
-These are **engine** metrics. Apps emit their own (e.g. the Data Connector's `niyanta_ingestion_*` series in [../apps/dataconnector/INGESTION_ARCHITECTURE.md](../apps/dataconnector/INGESTION_ARCHITECTURE.md) §Core Metrics; LLMOps' `niyanta_llmops_*` in [../apps/llmops/ARCHITECTURE.md](../apps/llmops/ARCHITECTURE.md) §Observability).
+These are **engine** metrics, exposed as Prometheus `/metrics` on every component and consumed by the Activity Manager console's integrated metrics store (Phase 6) or any external Prometheus. Consumers emit their own domain metrics under their own prefixes.
 
 **Coordinator**:
 - `niyanta_activities_total` (gauge, by customer, activity_type, status)
@@ -796,13 +738,16 @@ These are **engine** metrics. Apps emit their own (e.g. the Data Connector's `ni
 - `niyanta_run_child_calls_total` (counter, by activity_type)
 - `niyanta_activity_replay_duration_seconds` (histogram)
 - `niyanta_checkpoint_duration_seconds` (histogram)
+- `niyanta_fenced_writes_total` (counter — the audit trail of redistribution races)
+- `niyanta_parked_no_compatible_worker` (gauge — activities pinned to a version no worker advertises)
+- `niyanta_nondeterminism_failures_total` (counter)
 
 **State Storage**:
 - Standard PostgreSQL metrics (connections, query latency, replication lag)
 
 ### Logging Standards
 
-**Structured Logs** (JSON). The engine emits core fields; apps add their own dimensions (e.g. `connection_id`, `connector_definition_id`) in their activity logs.
+**Structured Logs** (JSON). The engine emits core fields; consumers add their own dimensions in their activity logs.
 
 ```json
 {
@@ -812,7 +757,7 @@ These are **engine** metrics. Apps emit their own (e.g. the Data Connector's `ni
   "correlation_id": "abc123",
   "customer_id": "customer_456",
   "activity_id": "act_456",
-  "activity_type": "ingestion_supervisor",
+  "activity_type": "sample_pipeline",
   "attempt_number": 1,
   "message": "Activity scheduled to worker-5",
   "worker_id": "worker-5"
@@ -821,7 +766,7 @@ These are **engine** metrics. Apps emit their own (e.g. the Data Connector's `ni
 
 **Log Levels**:
 - **DEBUG**: Detailed internal state (disabled in production)
-- **INFO**: Normal operations (connection/run/activity state changes)
+- **INFO**: Normal operations (activity/attempt state changes)
 - **WARN**: Recoverable errors (retry attempts)
 - **ERROR**: Failures requiring attention
 
@@ -838,8 +783,10 @@ These are **engine** metrics. Apps emit their own (e.g. the Data Connector's `ni
 - Queue depth > threshold for > 10 minutes
 - Replay/resume failure rate > threshold
 - API latency p95 > 500ms
+- Parked `no_compatible_worker` activities > 0 for > 15 minutes
+- Any `niyanta_nondeterminism_failures_total` increase
 
-Apps define their own domain alerts (connector lag, destination delivery failures, etc.) on their own metrics.
+Alert rules ship as code (`deploy/prometheus/alerts.yaml`) and are evaluated by the console's integrated store out of the box (Phase 6). Consumers define their own domain alerts on their own metrics.
 
 ---
 
@@ -850,10 +797,10 @@ Apps define their own domain alerts (connector lag, destination delivery failure
 **Rationale**: PostgreSQL handles complex queries (audit logs, activity/attempt/call-log history), provides ACID guarantees, mature backup/restore. etcd better for watches but limited query capability.
 **Alternatives Considered**: MongoDB (schemaless but weak consistency), Cassandra (eventual consistency issues)
 
-### ADR-002: Broker Choice
-**Decision**: NATS
-**Rationale**: Lightweight, native request-reply, subject-based routing, HA clustering. Redis Streams considered but NATS has better operational simplicity.
-**Alternatives Considered**: RabbitMQ (heavier), Kafka (overkill for control plane)
+### ADR-002: Dispatch / Broker Choice (revised 2026-07-06)
+**Decision**: Postgres-native dispatch (`FOR UPDATE SKIP LOCKED` pull + `LISTEN/NOTIFY` wakeups); no broker on the critical path. NATS JetStream remains an optional Phase 7 substrate behind the `TaskQueue`/`SignalBus` interfaces.
+**Rationale**: The state store is the source of truth either way; a broker added a stateful dependency and a second dispatch path without a correctness gain. Minimal-external-dependencies principle wins until measured throughput says otherwise.
+**Alternatives Considered**: NATS (original v1 choice — deferred, not rejected), RabbitMQ (heavier), Kafka (overkill for control plane), Redis Streams
 
 ### ADR-003: Language Choice
 **Decision**: Go
@@ -872,7 +819,7 @@ Apps define their own domain alerts (connector lag, destination delivery failure
 1. **Intra-tenant priority**: Should activities support priority levels within a single customer? (e.g., critical vs. batch)
 2. **Checkpoint compression**: Should checkpoint/heartbeat blobs be compressed automatically?
 3. **Multi-region**: How to handle cross-region deployments? (Future phase)
-4. **Activity-type versioning**: How to handle activity code updates without disrupting running instances? (Activities run to completion on the version they started; see ADR-005.)
+4. ~~**Activity-type versioning**~~ *Resolved*: suspended activities are **version-pinned** — they resume only on workers advertising the version recorded at first suspend; `ContinueAsNew` is the sanctioned re-pin point; drain tooling retires old versions (see IMPLEMENTATION_PLAN G1).
 
 ---
 
