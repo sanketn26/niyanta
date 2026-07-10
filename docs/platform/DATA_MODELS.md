@@ -299,7 +299,7 @@ CREATE INDEX idx_signals_pending ON signals(activity_id, name) WHERE delivered =
 CREATE UNIQUE INDEX idx_signals_dedupe ON signals(activity_id, dedupe_key) WHERE dedupe_key IS NOT NULL;
 ```
 
-**Delivery semantics**: at-least-once with idempotent handlers (see ADR-005 open question), with sender-side dedupe at the door via `dedupe_key`. The `SignalBus` interface abstracts the substrate (Postgres-backed initially; an optional NATS JetStream substrate in Phase 7) without changing activity code.
+**Delivery semantics**: at-least-once with idempotent handlers (see ADR-005 open question), with sender-side dedupe at the door via `dedupe_key`. The `SignalBus` interface abstracts the Postgres-backed substrate; alternatives require post-Phase-9 performance evidence.
 
 ---
 
@@ -463,12 +463,12 @@ Notifications carry **hints, never state** — payloads are identifiers only, an
 | `signal_arrived` | `activity_id` | Coordinator signal delivery | wake sweep |
 | `control_changed` | `activity_id` | Worker running that activity | 30s heartbeat |
 
-### Optional Phase 7 Substrate Envelope
+### Optional Post-Phase-9 Substrate Envelope
 
 If the JetStream `TaskQueue`/`SignalBus` substrates are adopted at scale, their wire format wraps the same identifiers-only philosophy; Postgres rows remain the source of truth:
 
 ```go
-// Used ONLY by the optional Phase 7 broker substrates.
+// Used ONLY by optional broker substrates adopted after production profiling.
 type Message struct {
     MessageID     string    `json:"message_id"`
     Type          string    `json:"type"`      // task_ready | signal_arrived | control_changed
@@ -840,7 +840,8 @@ Use **golang-migrate** for versioned migrations. Conventions:
 | `002_call_log` | Phase 3 | `activity_calls` + replay indexes; `activities.pinned_version`, `execution_seq`, `superseded_by` |
 | `003_signals` | Phase 4 | `signals` mailbox + pending index + dedupe key; `pending_timers` |
 | `004_api_keys` | Phase 5 | `api_keys`, `idempotency_keys` retention |
-| `005_coordinator_state` | Phase 7 | `coordinator_state` (if Postgres-based leader election) |
+| `005_console_auth` | Phase 7 | browser principals/sessions/preferences in a separate console schema; no core-state access |
+| `006_coordinator_state` | Phase 9 | `coordinator_state` for Postgres-based leader election |
 
 ```sql
 -- 001_core.up.sql

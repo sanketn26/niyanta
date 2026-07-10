@@ -10,13 +10,13 @@ New here? Start with [GETTING_STARTED.md](GETTING_STARTED.md). Editing docs? Rea
 docs/
   GETTING_STARTED.md            read/validate the specs; intended dev flow
   CONTRIBUTING_DOCS.md          where things go; vocabulary; pre-commit checks
-  IMPLEMENTATION_PLAN.md        phased delivery roadmap (engine-only, phases 0–7)
+  IMPLEMENTATION_PLAN.md        phased delivery roadmap (engine-only, phases 0–9)
   platform/                     the engine
     ARCHITECTURE.md             components, guarantees, HA, deployment, scaling, security
     DATA_MODELS.md              schemas, message formats, Go structs, invariants
     API_SPEC.md                 REST API contracts
     adr/                        architecture decision records
-    impl/                       phase implementation guides 0–7
+    impl/                       phase implementation guides 0–9
 api/openapi/                    machine-readable engine API (niyanta-v1.yaml)
 ```
 
@@ -26,11 +26,11 @@ api/openapi/                    machine-readable engine API (niyanta-v1.yaml)
 - [DATA_MODELS.md](platform/DATA_MODELS.md) — activity/attempt/call-log/signal schemas, message formats, Go structs
 - [API_SPEC.md](platform/API_SPEC.md) — REST API contracts
 - [adr/ADR-005-activity-execution-model.md](platform/adr/ADR-005-activity-execution-model.md) — the activity execution model (`RunChild`, replay, signals, `ContinueAsNew`)
-- [impl/](platform/impl/README.md) — implementation phases 0–7
+- [impl/](platform/impl/README.md) — implementation phases 0–9
 
 ## Roadmap
 
-- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) — phased build plan: skeleton → persistence + fencing → distributed workers → composition/replay → timers/signals/`ContinueAsNew` → production API + tenancy → Activity Manager console + integrated observability → HA/scale hardening
+- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) — phased build plan: skeleton → persistence + fencing → distributed workers → composition/replay → timers/signals/`ContinueAsNew` → safe operator API → read-only console → operator workflows → observability → production hardening
 
 ## The contract in one paragraph
 

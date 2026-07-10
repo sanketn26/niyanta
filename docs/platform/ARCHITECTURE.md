@@ -78,7 +78,8 @@ This is the **engine**. It runs activities; consumers register activity types an
        │ Dispatch     │ │ State Store  │ │ Observability│
        │ Postgres     │ │ Postgres     │ │ Metrics/Logs │
        │ SKIP LOCKED  │ │ + optional   │ │ Traces       │
-       │ + NOTIFY     │ │ etcd         │ │ (console)    │
+       │ + NOTIFY     │ │ etcd         │ │ Prometheus / │
+       │              │ │              │ │ OTel backend │
        └──────┬───────┘ └──────┬───────┘ └──────────────┘
               │                │
               ▼                ▼
@@ -101,7 +102,7 @@ This is the **engine**. It runs activities; consumers register activity types an
 | Coordinator | 3+ (HA) | API, activity scheduling, timers/signals, lifecycle management | No |
 | Worker | N (horizontal) | Execute any registered activity type; dispatch children; heartbeat | No |
 | State Storage | 1 cluster | Activities, attempts, call log, signals, checkpoints, audit | Yes |
-| Broker (optional, Phase 7) | 1 cluster | Drop-in `TaskQueue`/`SignalBus` substrate at scale; not on the critical path | Optional |
+| Broker (optional, post-Phase 9) | 1 cluster | Drop-in `TaskQueue`/`SignalBus` substrate only if the measured Postgres envelope is insufficient | Optional |
 | Observability Store | 1+ | Metrics, logs, traces | Yes |
 
 Domain-specific control planes built by consumers are **not** engine components — they are activity compositions plus their own state, layered on the above and documented wherever those products live.
@@ -287,7 +288,7 @@ There is no `Init`/`Checkpoint`/`Close`: framework-managed retries replace manua
 - `LISTEN/NOTIFY` wakes idle workers so dispatch latency is not bounded by the poll interval; the poll loop remains as fallback, so a dropped notification costs latency, never correctness.
 - Registration, heartbeats, and completions are rows in the state store — one source of truth, no state/broker reconciliation problem.
 
-**Optional broker (Phase 7)**: NATS JetStream implementations of the `TaskQueue` and `SignalBus` interfaces exist as drop-in substitutes if measured Postgres dispatch throughput demands them. Adopting them is a configuration change, not an activity-code change.
+**Optional broker (post-Phase 9)**: NATS JetStream implementations may be evaluated behind the `TaskQueue` and `SignalBus` interfaces only if the published Postgres throughput envelope is insufficient.
 
 **Durability model**:
 - Notifications are hints only; Postgres rows are the source of truth.
@@ -441,7 +442,7 @@ All coordinator↔worker communication is **state-based with notification hints*
 
 A dropped notification costs at most one poll interval (2s dispatch, 30s control), never a lost operation.
 
-### 3. Optional Broker Substrate (Phase 7)
+### 3. Optional Broker Substrate (Post-Phase 9)
 If JetStream `TaskQueue`/`SignalBus` implementations are adopted at scale, they replace pattern 2's transport behind the same interfaces; pattern 1 remains the source of truth.
 
 ---
@@ -544,7 +545,7 @@ spec:
 - Instance: db.m5.large (start), scale up as needed
 - Read replicas for query offloading (optional)
 
-**Broker (optional, Phase 7 only)**:
+**Broker (optional, post-Phase 9 only)**:
 - Only deployed if JetStream substrates are adopted at scale; not part of the baseline footprint
 - Clustered deployment (3 nodes), t3.small sufficient for control-plane traffic
 
@@ -610,9 +611,11 @@ spec:
 ### Authentication & Authorization
 
 **API Authentication**:
-- Option 1: API keys (for simple deployment)
-- Option 2: JWT tokens (for SSO integration)
-- Option 3: mTLS (for service-to-service)
+- API keys for service clients, hashed at rest
+- OIDC-backed server sessions for the browser console; local session provider for air-gapped installs
+- mTLS for service-to-service deployments that require it
+
+The API enforces tenant-scoped capabilities for state reads, payload reads, routine operations, recovery operations, worker drains, and tenant administration. Browser sessions use secure cookies plus CSRF protection; service API keys are never stored in the browser.
 
 **Customer Isolation**:
 - Each API call includes `customer_id` (extracted from auth token)
@@ -629,23 +632,23 @@ spec:
 - NetworkPolicies to isolate:
   - Coordinators can reach: State storage
   - Workers can reach: State storage (their scoped role), plus whatever egress their activity types need
-  - Console can reach: Coordinator API, plus coordinator/worker `/metrics` (scrape)
+  - Console can reach: Coordinator API and a configured Prometheus endpoint; it never connects to core Postgres
   - External clients can reach: Coordinator API and console only
-  - (Phase 7 only, if adopted) broker reachable from coordinator/worker
+  - (post-Phase 9 only, if adopted) broker reachable from coordinator/worker
 
 **EC2**:
 - Security Groups:
-  - Coordinator: Inbound 443/8080 (API) + `/metrics` from console, Outbound all
-  - Worker: Inbound `/metrics` from console only, Outbound all
+  - Coordinator: Inbound 443/8080 (API) + `/metrics` from configured Prometheus scrapers, Outbound all
+  - Worker: Inbound `/metrics` from configured Prometheus scrapers only, Outbound all
   - State storage: Inbound 5432/2379 from coordinator/worker, no public access
   - Console: Inbound 443 (UI), Outbound to coordinator/workers/state
-  - (Phase 7 only, if adopted) Broker: Inbound 4222 from coordinator/worker
+  - (post-Phase 9 only, if adopted) Broker: Inbound 4222 from coordinator/worker
 
 ### Secrets Management
 
 **Configuration**:
 - Database credentials: Kubernetes Secrets / AWS Secrets Manager
-- Broker credentials (Phase 7 only, if adopted): Same as above
+- Broker credentials (post-Phase 9 only, if adopted): Same as above
 - Activity secrets: passed as secret references in `input_json` (never values) and resolved inside approved worker runtimes
 
 **Encryption**:
@@ -663,7 +666,7 @@ spec:
 | Coordinator | CPU > 70% | 10 instances | Stateless, unlimited in theory |
 | Worker | Queue depth > 100 | 500 instances | Depends on activity-type resource needs |
 | State Storage | Transitions/sec, connections, IOPS | 1 primary + replicas | The engine's scaling unit; also carries dispatch |
-| Broker (optional, Phase 7) | Message throughput | 3-node cluster sufficient | Only if JetStream substrates adopted |
+| Broker (optional, post-Phase 9) | Message throughput | Size from measured need | Only if JetStream substrates are adopted |
 
 ### Deployment Density And Isolation
 
@@ -712,7 +715,7 @@ Isolation requirements:
 | Redistribution time | < 2 minutes | From failure to reassignment |
 | Checkpoint commit latency | p95 < 1s | Heartbeat persist |
 
-> The meaningful load unit for capacity planning is **state transitions/sec** (each suspend point is several transactions), not concurrent-activity count. The engine's transition-throughput envelope is published as part of its contract (Phase 7 load tests).
+> The meaningful load unit for capacity planning is **state transitions/sec** (each suspend point is several transactions), not concurrent-activity count. Phase 9 publishes the transition-throughput and operator-query envelope.
 
 ---
 
@@ -720,14 +723,14 @@ Isolation requirements:
 
 ### Key Metrics
 
-These are **engine** metrics, exposed as Prometheus `/metrics` on every component and consumed by the Activity Manager console's integrated metrics store (Phase 6) or any external Prometheus. Consumers emit their own domain metrics under their own prefixes.
+These are **engine** metrics, exposed as Prometheus `/metrics` on every component. External Prometheus is the production default in Phase 8; the console may query it for charts. State hot lists use the authorized engine API, not metrics. Consumers emit domain metrics under their own prefixes.
 
 **Coordinator**:
-- `niyanta_activities_total` (gauge, by customer, activity_type, status)
+- `niyanta_activities_total` (gauge by bounded `activity_type` and `status`; raw customer IDs are excluded by default)
 - `niyanta_activity_duration_seconds` (histogram, by activity_type)
-- `niyanta_scheduler_queue_depth` (gauge, by priority)
+- `niyanta_scheduler_queue_depth` (gauge, by bounded priority class)
 - `niyanta_scheduler_dispatch_latency_seconds` (histogram)
-- `niyanta_signals_delivered_total` (counter, by name)
+- `niyanta_signals_delivered_total` (counter; signal name label allowed only from a bounded configured set)
 - `niyanta_timers_fired_total` (counter)
 - `niyanta_worker_pool_size` (gauge, by status: healthy/dead)
 
@@ -786,7 +789,7 @@ These are **engine** metrics, exposed as Prometheus `/metrics` on every componen
 - Parked `no_compatible_worker` activities > 0 for > 15 minutes
 - Any `niyanta_nondeterminism_failures_total` increase
 
-Alert rules ship as code (`deploy/prometheus/alerts.yaml`) and are evaluated by the console's integrated store out of the box (Phase 6). Consumers define their own domain alerts on their own metrics.
+Alert rules ship as code (`deploy/prometheus/alerts.yaml`) for Prometheus in Phase 8. An optional embedded profile may evaluate the same rules only if its lifecycle requirements are implemented and tested. Consumers define their own domain alerts.
 
 ---
 
@@ -798,7 +801,7 @@ Alert rules ship as code (`deploy/prometheus/alerts.yaml`) and are evaluated by 
 **Alternatives Considered**: MongoDB (schemaless but weak consistency), Cassandra (eventual consistency issues)
 
 ### ADR-002: Dispatch / Broker Choice (revised 2026-07-06)
-**Decision**: Postgres-native dispatch (`FOR UPDATE SKIP LOCKED` pull + `LISTEN/NOTIFY` wakeups); no broker on the critical path. NATS JetStream remains an optional Phase 7 substrate behind the `TaskQueue`/`SignalBus` interfaces.
+**Decision**: Postgres-native dispatch (`FOR UPDATE SKIP LOCKED` pull + `LISTEN/NOTIFY` wakeups); no broker on the critical path. Alternative substrates require post-Phase-9 performance evidence.
 **Rationale**: The state store is the source of truth either way; a broker added a stateful dependency and a second dispatch path without a correctness gain. Minimal-external-dependencies principle wins until measured throughput says otherwise.
 **Alternatives Considered**: NATS (original v1 choice — deferred, not rejected), RabbitMQ (heavier), Kafka (overkill for control plane), Redis Streams
 

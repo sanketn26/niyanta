@@ -17,9 +17,9 @@ For working on the docs/specs today:
 For building the engine once code exists (target stack, per CLAUDE.md and the impl phases):
 
 - Go (toolchain version per `go.mod` when it lands)
-- PostgreSQL 15+ (state store — the only required external dependency through Phase 6)
+- PostgreSQL 15+ (engine state store)
 - `golang-migrate` (migrations), `golangci-lint` (lint)
-- Prometheus + Grafana (Phase 6 observability stack; shipped in the dev docker-compose)
+- Prometheus + Grafana (optional until Phase 8; production observability profile)
 
 ## Today: read and validate the specs
 
@@ -63,7 +63,7 @@ Per [platform/impl/PHASE_0_SKELETON.md](platform/impl/PHASE_0_SKELETON.md), Phas
 
 Read the phases in order — each ends with a runnable system:
 
-1. [platform/impl/README.md](platform/impl/README.md) — phases 0–7 (engine, production surface, console, hardening)
+1. [platform/impl/README.md](platform/impl/README.md) — phases 0–9 (engine, safe API, staged console, observability, production hardening)
 
 The roadmap with effort estimates and gap-resolution mapping is [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
 

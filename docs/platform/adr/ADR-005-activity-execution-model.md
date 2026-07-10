@@ -9,7 +9,7 @@
 Design review closed six gaps in this ADR's contract; the resolutions are scheduled in [IMPLEMENTATION_PLAN.md](../../IMPLEMENTATION_PLAN.md) §Gap Resolutions and bind where they conflict with the original text below:
 
 1. **Version-pinned replay (G1)** replaces "activities run to completion on the version they started with" as an *enforced* mechanism: suspended activities resume only on workers advertising the pinned version; `ContinueAsNew` is the sanctioned re-pin point; drain tooling retires versions.
-2. **Heartbeat × replay mutual exclusivity (G2)**: `Heartbeat`/`LastHeartbeat` are legal only in activities that never suspend; heartbeat state is cross-attempt. Runtime-guarded from Plan Phase 3, linted in Phase 7.
+2. **Heartbeat × replay mutual exclusivity (G2)**: `Heartbeat`/`LastHeartbeat` are legal only in activities that never suspend; heartbeat state is cross-attempt. Runtime-guarded from Plan Phase 3, linted in Phase 9.
 3. **Write-path fencing (G3)**: generation checks apply to every state-mutating *write*, not just command receipt; a stale worker's completion/heartbeat/call-log writes fail with `ErrFenced`.
 4. **Exactly-once child dispatch (G4)** tightens Consequence "children may be invoked twice": dispatch is transactional with the call-log append and a logged call is never re-dispatched; only side effects *inside* a child remain at-least-once (bounded by the child's retry policy).
 5. **`ctx.ContinueAsNew(input)` (G5)** joins the primitive set: completes the current execution and starts a successor with a fresh call log while preserving activity identity (signal routing, composition links). Bounds replay for unbounded-lifetime activities; answers Open Question 3.
@@ -44,7 +44,7 @@ Adopt a **Temporal-inspired activity execution model**, scoped to what the use c
 3. **Sub-activity calls (`RunChild`) are durable suspend points.** When a parent calls `RunChild`, the framework records the call, frees the parent's worker slot, and re-dispatches the parent when the child completes. The child runs as a normal activity (in-process or remote — framework's choice).
 4. **Replay-based resume across `RunChild` boundaries.** On parent resume, the activity body re-executes from the top. Each `RunChild` call checks the durable call log; calls with recorded results return immediately without re-dispatching. The parent fast-forwards to its previous suspension point.
 5. **Determinism rule on parent code.** Parent activity code (anything outside `RunChild`-dispatched children) must be deterministic. Direct use of `time.Now()`, `rand`, I/O, and concurrent goroutines is forbidden in parent code. Equivalent primitives are exposed on `ActivityContext`: `ctx.Now()`, `ctx.NewID()`, `ctx.Sleep()`. All side-effecting work goes through `RunChild`.
-6. **Signals as the external-event mechanism.** Signals are addressed to a running activity by ID and delivered to a durable per-activity mailbox, with sender-side dedupe keys. `ctx.AwaitSignal(name, timeout)` suspends the activity until a matching signal arrives or the timeout fires. Signals abstracted behind a `SignalBus` interface; backing impl is decoupled from the API (Postgres-backed from Plan Phase 4; an optional NATS JetStream substrate in Plan Phase 7).
+6. **Signals as the external-event mechanism.** Signals are addressed to a running activity by ID and delivered to a durable per-activity mailbox, with sender-side dedupe keys. `ctx.AwaitSignal(name, timeout)` suspends the activity until a matching signal arrives or the timeout fires. The `SignalBus` is Postgres-backed from Plan Phase 4; alternatives require post-Phase-9 evidence.
 7. **Heartbeat-based checkpointing remains optional — and is mutually exclusive with suspend points (G2).** Leaf activities with long in-process loops may call `ctx.Heartbeat(state)` to persist fine-grained progress; `ctx.LastHeartbeat()` returns the prior attempt's last state on retry. Calling either in an activity that has any suspend-point history is a runtime error (`ErrHeartbeatWithReplay`) — branching on heartbeat state in replayed code is nondeterministic by construction.
 8. **`ctx.ContinueAsNew(input)` bounds replay history (G5).** Completes the current execution and atomically starts a successor with a fresh call log, preserving the activity's external identity (ID, signal routing, composition links). The primitive for unbounded-lifetime activities; also the sanctioned point to re-pin onto new code.
 9. **Per-attempt records replace `retry_count` integer.** Each retry is a row in `activity_attempts`, capturing attempt number, start/end times, error, and worker. The activity itself (`activities` table) records the logical execution; attempts record the physical retries. Provides audit trail for autonomous systems where retries happen unattended.
@@ -103,14 +103,14 @@ The signal delivery substrate is the most likely component to be swapped out as 
 
 ## Implementation Phasing
 
-This ADR describes the **engine capability sequence** — the order in which the activity-execution features land. These are *capability milestones*, not the system-wide delivery phases in [IMPLEMENTATION_PLAN.md](../../IMPLEMENTATION_PLAN.md) (which numbers 0–7 across the engine, production surface, console, and hardening). The cross-walk below is the single source of truth for which system phase delivers each capability; where this ADR and the plan ever disagree on numbering, the plan's phase numbers win and this column is the mapping.
+This ADR describes the **engine capability sequence** — the order in which the activity-execution features land. These are *capability milestones*, not the system-wide delivery phases in [IMPLEMENTATION_PLAN.md](../../IMPLEMENTATION_PLAN.md) (which numbers 0–9 across the engine, API, console, observability, and hardening).
 
 | Capability milestone | Scope | Delivered in system phase |
 |---|---|---|
 | **M1 — Single-attempt activities** | `Activity` interface, `ctx.Heartbeat`, framework-enforced retry policy, write-path fencing invariant. No `RunChild`, no signals, no resume. | Plan Phase 1 (persistence + retries + fencing) |
 | **M2 — Composition + replay** | `RunChild` with sequential dispatch (exactly-once). Replay-based resume across `RunChild` boundaries. Version-pinned replay. `activity_calls` table. | Plan Phase 3 (child activities + replay) |
 | **M3 — Deterministic primitives + signals + history truncation** | `ctx.Sleep`, `ctx.Now`, `ctx.NewID`. `SignalBus` interface + Postgres-backed impl. `ctx.AwaitSignal`. `ctx.ContinueAsNew`. `signals` table with sender dedupe. | Plan Phase 4 (timers + signals + ContinueAsNew) |
-| **M4 — Hardening** | Determinism linter for parent code. Optional NATS JetStream-backed `SignalBus`/`TaskQueue`. Sticky-worker replay optimization and replay performance for large call counts. | Plan Phase 7 (HA, scale, hardening) |
+| **M4 — Hardening** | Determinism linter for parent code; replay performance and alternative substrate evaluation from measured evidence. | Plan Phase 9 (production hardening); optional substrates post-Phase 9 |
 
 **Signals are MVP-mandatory.** The event-driven-monitor shape is unworkable without them; they land in Plan Phase 4 (capability M3). (This corrected an earlier draft that deferred signals; the duplicate "Phase 2" rows in that draft conflated M2 and M3 and have been split.)
 
@@ -136,7 +136,7 @@ Activity calls `ctx.Suspend()` at known points; framework only frees the slot at
 
 - [ARCHITECTURE.md](../ARCHITECTURE.md) — system context this ADR modifies
 - [DATA_MODELS.md](../DATA_MODELS.md) — schema to be updated for `activity_calls`, `activity_attempts`, `signals`
-- [IMPLEMENTATION_PLAN.md](../../IMPLEMENTATION_PLAN.md) — system-wide delivery phases (0–7); see the capability cross-walk above for how engine milestones map onto them
+- [IMPLEMENTATION_PLAN.md](../../IMPLEMENTATION_PLAN.md) — system-wide delivery phases (0–9); see the capability cross-walk above for how engine milestones map onto them
 - [impl/PHASE_3_CHILD_ACTIVITIES_REPLAY.md](../impl/PHASE_3_CHILD_ACTIVITIES_REPLAY.md) — child activity and replay interface details
 - [impl/PHASE_4_TIMERS_SIGNALS.md](../impl/PHASE_4_TIMERS_SIGNALS.md) — timer and signal delivery design
 - Temporal documentation, *Workflows* and *Activities* sections — primary inspiration

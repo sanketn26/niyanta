@@ -1,9 +1,9 @@
 # Niyanta Implementation Plan
 
-**Version**: 3.0
-**Last Updated**: 2026-07-06
+**Version**: 3.1
+**Last Updated**: 2026-07-10
 **Status**: Planning Phase
-**Supersedes**: v2.2. This revision makes the plan **use-case agnostic**: Niyanta is planned, built, and hardened purely as a durable activity execution engine. Application compositions (ingestion, LLMOps, or anything else) are built *on* the engine and are planned in their own documents — they no longer appear in this plan. This revision also resolves six engine-contract gaps identified in design review (see §[Gap Resolutions](#gap-resolutions)) and adds a first-class **Activity Manager console** with built-in cluster and Prometheus observability.
+**Supersedes**: v3.0. This revision keeps the use-case-agnostic engine and six contract-gap resolutions, but grounds delivery of the Activity Manager: read-only inspection, privileged operations, observability, and production hardening are separate acceptance gates.
 
 ## Table of Contents
 1. [Executive Summary](#executive-summary)
@@ -15,12 +15,14 @@
    - [Phase 3: Sub-activities, replay-based resume, version-pinned replay](#phase-3-sub-activities-replay-based-resume-version-pinned-replay)
    - [Phase 4: Deterministic primitives, signals, ContinueAsNew](#phase-4-deterministic-primitives-signals-continueasnew)
    - [Phase 5: Production engine surface — API completeness, multi-tenancy, deployment safety](#phase-5-production-engine-surface--api-completeness-multi-tenancy-deployment-safety)
-   - [Phase 6: Activity Manager console + observability stack](#phase-6-activity-manager-console--observability-stack)
-   - [Phase 7: HA, scale, hardening](#phase-7-ha-scale-hardening)
+   - [Phase 6: Read-only Activity Manager console](#phase-6-read-only-activity-manager-console)
+   - [Phase 7: Operator workflows + live updates](#phase-7-operator-workflows--live-updates)
+   - [Phase 8: Observability distribution](#phase-8-observability-distribution)
+   - [Phase 9: Production hardening gate](#phase-9-production-hardening-gate)
 4. [Risk Management](#risk-management)
 5. [Success Metrics](#success-metrics)
 6. [Timeline & Milestones](#timeline--milestones)
-7. [Post-Phase 7 Roadmap](#post-phase-7-roadmap)
+7. [Post-Phase 9 Roadmap](#post-phase-9-roadmap)
 8. [Appendix](#appendix)
 9. [References](#references)
 10. [Revision History](#revision-history)
@@ -38,15 +40,17 @@ Niyanta is a **durable activity execution engine**: it runs activities, guarante
 3. **Phase 3**: `RunChild` with **exactly-once child dispatch**, replay-based resume, **version-pinned replay**, and a defined recovery path for determinism violations.
 4. **Phase 4**: Durable timers, deterministic primitives, signals with sender-side dedupe, **`ContinueAsNew`** for history truncation, and defined cancellation semantics for suspended activities.
 5. **Phase 5**: Production engine surface — complete REST API (pause/resume, long-poll wait, operator recovery endpoints), auth, multi-tenant isolation, priority, rate limiting, backpressure, deployment-safety tooling (version drain).
-6. **Phase 6**: **Activity Manager console with integrated observability** — a web UI over the engine with activity search/detail/composition-tree/replay-timeline views, operator actions, and a live cluster view, shipping its **own built-in metrics pipeline** (embedded scraper + local TSDB) so observability works with zero external infrastructure, while every component stays Prometheus-compatible (`/metrics`, PromQL, standard alert rule files) for teams that run their own stack.
-7. **Phase 7**: Coordinator HA, optional NATS JetStream substrates, determinism linter, chaos testing, scale tuning to 10K concurrent activities.
+6. **Phase 6**: A read-only **Activity Manager console** over the versioned engine API: activity search/detail, attempt and replay timelines, composition tree, workers, and versions. It has no direct access to core Postgres tables.
+7. **Phase 7**: Safe operator workflows and live updates: browser identity, capability-based authorization, optimistic concurrency, transactional audit, and reconnectable SSE.
+8. **Phase 8**: Prometheus-compatible observability: bounded-cardinality metrics, alert rules, dashboards, and tracing. External Prometheus is the production default; an embedded store is an optional, explicitly single-node convenience profile.
+9. **Phase 9**: Mandatory production gate: coordinator HA, backup/restore, security review, chaos and failover tests, upgrade/rollback, and a published capacity envelope.
 
 ### What changed from v2
 
 - **All application content removed.** Former Phases 5/5A/5B (connector registry, ingestion planner, catalog import, CDC, Airbyte compatibility) are out of this plan entirely. Compositions consume the engine's public API and SDK; they never gate or shape engine phases. Engine features are justified only by the engine's own contract.
 - **Six contract gaps are now scheduled work** with owning phases and acceptance tests (§[Gap Resolutions](#gap-resolutions)).
-- **NATS removed from the critical path.** Phase 2 dispatch is Postgres-native (`SELECT … FOR UPDATE SKIP LOCKED` pull model + `LISTEN/NOTIFY` for latency). This honors the minimal-external-dependencies principle; NATS JetStream returns in Phase 7 as an optional scale substrate behind the existing interfaces. Rationale: the v2 plan built a Postgres task queue in Phase 1 and then added a second, push-based dispatch path over NATS in Phase 2 — two dispatch mechanisms, one extra stateful dependency, no correctness gain (the broker held no durable state and the state store remained the source of truth).
-- **New Phase 6** delivers the Activity Manager console and observability stack as a first-class engine deliverable, not an afterthought.
+- **NATS removed from the critical path.** Phase 2 dispatch is Postgres-native (`SELECT … FOR UPDATE SKIP LOCKED` pull model + `LISTEN/NOTIFY` for latency). A broker is considered only after Phase 9 if the published Postgres envelope is insufficient.
+- **Phases 6–9 are deliberately separated.** Read-only inspection, privileged control, observability distribution, and production hardening have different failure and security boundaries and are accepted independently.
 
 ### Phases Overview
 
@@ -57,16 +61,19 @@ Niyanta is a **durable activity execution engine**: it runs activities, guarante
 | Phase 2 | 2 weeks | Coordinator + worker split, Postgres-native dispatch, failure redistribution, leases, affinity |
 | Phase 3 | 4 weeks | `RunChild` + replay, exactly-once dispatch, version-pinned replay, determinism-violation recovery |
 | Phase 4 | 4 weeks | `Sleep`/`Now`/`NewID`, `SignalBus` + `AwaitSignal`, signal dedupe, `ContinueAsNew`, cancellation semantics |
-| Phase 5 | 3 weeks | Complete REST API, auth, multi-tenant isolation, priority + aging, rate limits, backpressure, version drain |
-| Phase 6 | 3 weeks | Activity Manager web console with integrated observability (built-in metrics store, cluster view, Prometheus-compatible), alert rules, OTel tracing |
-| Phase 7 | open-ended | Coordinator HA, JetStream substrates (optional), determinism lint, chaos, scale to targets |
+| Phase 5 | 4 weeks | Complete operator/read API, auth and tenancy, concurrency controls, transactional audit, version drain |
+| Phase 6 | 3 weeks | Read-only Activity Manager: activities, timelines, composition, workers, versions; external Prometheus optional |
+| Phase 7 | 3 weeks | Browser sessions/OIDC, capability authorization, safe actions, reconnectable SSE |
+| Phase 8 | 3 weeks | Metrics, alert rules, dashboards, tracing; optional embedded single-node metrics profile |
+| Phase 9 | 4+ weeks | HA, backup/restore, security, chaos, upgrade/rollback, load envelope; production gate |
 
 **Stop point for prototypes**: end of Phase 4 — the full execution model is expressible and correct.
-**Stop point for production**: end of Phase 6 — multi-tenant, observable, operable engine with a console.
-**Phase 7** is incremental hardening driven by actual scale needs.
+**Stop point for operational beta**: end of Phase 8 — multi-tenant, inspectable, operable, and observable, but not yet claimed HA.
+**Stop point for production**: end of Phase 9 — the durability claims have survived failover, restore, chaos, security, and upgrade drills.
 
 **Total time to model completeness (solo)**: ~13 weeks (Phases 0–4).
-**Total time to production engine (solo)**: ~19 weeks (Phases 0–6).
+**Total time to operational beta (solo)**: ~26 weeks (Phases 0–8).
+**Total time to production gate (solo)**: ~30+ weeks (Phases 0–9); Phase 9 exits on evidence, not elapsed time.
 
 ---
 
@@ -76,12 +83,12 @@ Design review identified six gaps in the engine contract. Each is now owned by a
 
 | # | Gap | Resolution | Owning phase |
 |---|-----|------------|--------------|
-| G1 | **Versioning under replay.** A suspended parent may resume on a worker running newer code; a reordered/added/removed `RunChild` produces a false "determinism violation." | Workers advertise `{activity_type, version}`. Activities that have suspend-point history are **pinned**: they resume only on workers advertising the version recorded at first dispatch. Version drain tooling lets operators retire old versions safely. | P3 (pinning), P5 (drain tooling), P6 (console visibility) |
-| G2 | **Heartbeat × replay composition undefined.** Branching on `LastHeartbeat()` in code that also suspends breaks replay determinism. | **Mutual exclusivity rule**: heartbeat state is readable only in activities that never suspend. Stated in P1 docs; enforced at runtime in P3 (calling `LastHeartbeat` in an activity with any call-log entries is an immediate, clear error); linted in P7. Heartbeat scope is fixed as **cross-attempt within the current version pin** (retry sees prior attempt's heartbeat), and the `checkpoints` unique key includes `attempt_id`. | P1 (rule + schema), P3 (guard), P7 (lint) |
+| G1 | **Versioning under replay.** A suspended parent may resume on a worker running newer code; a reordered/added/removed `RunChild` produces a false "determinism violation." | Workers advertise `{activity_type, version}`. Activities that have suspend-point history are **pinned**: they resume only on workers advertising the version recorded at first dispatch. Version drain tooling lets operators retire old versions safely. | P3 (pinning), P5 (drain tooling), P6 (visibility), P7 (UI action) |
+| G2 | **Heartbeat × replay composition undefined.** Branching on `LastHeartbeat()` in code that also suspends breaks replay determinism. | **Mutual exclusivity rule**: heartbeat state is readable only in activities that never suspend. Stated in P1 docs; enforced at runtime in P3 (calling `LastHeartbeat` in an activity with any call-log entries is an immediate, clear error); linted in P9. Heartbeat scope is fixed as **cross-attempt within the current version pin** (retry sees prior attempt's last heartbeat), and the `checkpoints` unique key includes `attempt_id`. | P1 (rule + schema), P3 (guard), P9 (lint) |
 | G3 | **Fencing specified on the command path only.** A stale (SIGSTOP'd, partitioned) worker can still *write* completions, heartbeats, or call-log rows. | **Write-path fencing invariant**: every state-mutating write carries the worker's generation and commits only under `WHERE generation = $expected`. No exceptions. Invariant documented in DATA_MODELS transaction boundaries; every store impl tested against it. | P1 (single-process), P2 (multi-worker acceptance test) |
 | G4 | **Idempotency bound understated.** ADR-005 says children "may be invoked twice"; the transactional call-log design actually supports exactly-once dispatch. | `RunChild` dispatch is transactional with the call-log append: on replay, an existing incomplete call-log row means **wait, never re-dispatch**. Contract tightened to: *child dispatch is exactly-once; side effects inside a child are at-least-once, bounded by the child's retry policy*. | P3 |
 | G5 | **Unbounded history for unbounded-lifetime activities.** `Sleep`/`AwaitSignal` invite immortal activities; replay cost grows monotonically with call count; retention cannot truncate a live activity's log. | **`ctx.ContinueAsNew(input)`**: atomically complete the current execution and start a successor with a fresh call log, preserving the activity's external identity (ID for signal addressing, composition links, console history chain). Designed before Phase 3 code freezes the call-log schema; implemented in Phase 4. | P4 (schema groundwork in P3) |
-| G6 | **No recovery path from determinism violation.** Detection exists; the activity is silently poisoned — retry replays into the same wall. | Distinct terminal-ish state `FAILED` with `error_json.type = "nondeterminism"` that **suppresses automatic retry**. Operator recovery endpoints: force-fail, force-complete-with-result, and guarded truncate-replay-to-last-consistent-prefix + resume. Surfaced in the console. | P3 (state + suppression), P5 (recovery API), P6 (console) |
+| G6 | **No recovery path from determinism violation.** Detection exists; the activity is silently poisoned — retry replays into the same wall. | Distinct terminal-ish state `FAILED` with `error_json.type = "nondeterminism"` that **suppresses automatic retry**. Operator recovery endpoints: force-fail, force-complete-with-result, and guarded truncate-replay-to-last-consistent-prefix + resume. Surfaced read-only in P6 and actionable in P7. | P3 (state + suppression), P5 (recovery API), P6–P7 (console) |
 
 Additional review items folded in: attempt-status gets its own enum including `INTERRUPTED` (P1); lease moves to the attempt (P2); call log keyed by `activity_id` (P3, matching DATA_MODELS, since replay spans attempts); `result_json` size cap (P3); `Now()`/`NewID()` recorded per call with segment batching (P4); signal sends take an idempotency key (P4); pause/resume + long-poll wait endpoints (P5).
 
@@ -93,7 +100,7 @@ The phases are designed so that **each one ends with a runnable system**. If you
 
 ### Guiding principles
 
-1. **Interfaces from day one.** Every storage and dispatch concern lives behind an interface starting in Phase 0: `ActivityStore`, `AttemptStore`, `HeartbeatStore`, `ActivityCallStore`, `WorkerRegistry`, `LeaderElector`, `TaskQueue`, `SignalBus`, `EventBus`. Phase 1's Postgres impls can be swapped for Phase 7's JetStream impls without touching activity code.
+1. **Interfaces from day one.** Every storage and dispatch concern lives behind an interface starting in Phase 0: `ActivityStore`, `AttemptStore`, `HeartbeatStore`, `ActivityCallStore`, `WorkerRegistry`, `LeaderElector`, `TaskQueue`, `SignalBus`, `EventBus`. Optional substrates can be evaluated after the production envelope is measured without touching activity code.
 2. **In-memory before external.** Phase 0 ships an in-memory implementation of every interface. End-to-end runs before any external dependency is introduced.
 3. **Vertical slices.** Build one activity end-to-end (submit → schedule → execute → complete), then add capabilities to that slice phase by phase.
 4. **Test what's invisible.** Replay, retry, fencing, and resume are invisible when they work. Failing tests come first: kill a worker mid-activity, SIGSTOP a worker and let it wake stale, drop a signal, redeploy changed code under a suspended parent. Make them pass.
@@ -162,7 +169,7 @@ The phases are designed so that **each one ends with a runnable system**. If you
 
 **Key Deliverables**:
 - Split binaries: `cmd/coordinator/`, `cmd/worker/`. Shared code in `internal/`.
-- **Postgres-native dispatch (no broker)**: workers pull work with `FOR UPDATE SKIP LOCKED` against the task queue, filtered by their advertised activity types/tags; `LISTEN/NOTIFY` wakes idle workers so dispatch latency isn't bounded by the poll interval. Worker registration, heartbeats (every 30s, with capacity and in-flight inventory), and completions are rows/notifications in Postgres. The `EventBus`/`TaskQueue` interfaces are unchanged — a NATS/JetStream impl remains a Phase 7 drop-in if scale demands it.
+- **Postgres-native dispatch (no broker)**: workers pull work with `FOR UPDATE SKIP LOCKED` against the task queue, filtered by their advertised activity types/tags; `LISTEN/NOTIFY` wakes idle workers so dispatch latency isn't bounded by the poll interval. Worker registration, heartbeats (every 30s, with capacity and in-flight inventory), and completions are rows/notifications in Postgres. The `EventBus`/`TaskQueue` interfaces preserve a measured post-Phase-9 substitution path.
 - Coordinator process: scheduler loop (admission: quotas, capability match), health monitor loop; minimal HTTP API for `submit/get/list/cancel` (no auth yet).
 - Worker failure detection: mark workers `DEAD` after 60s without heartbeat; mark their in-flight attempts `INTERRUPTED`; re-enqueue.
 - **Leases on the attempt** (not the activity): `activity_attempts.lease_expires_at`, renewed by worker heartbeat; expiry triggers redistribution. `generation` on the activity is bumped on every redistribution.
@@ -214,7 +221,7 @@ The phases are designed so that **each one ends with a runnable system**. If you
 - Determinism-violation test: an activity that randomly skips a `RunChild` on replay → fails with `nondeterminism` error naming the divergent call index, and is **not** retried automatically.
 - Heartbeat-guard test: an activity calling `Heartbeat` after a `RunChild` gets `ErrHeartbeatWithReplay`.
 
-**Explicitly out of scope**: `Sleep`, `Now`, `NewID`, signals, `ContinueAsNew` behavior (schema only), in-process child optimization (children always dispatch through the queue; sticky-worker optimization is Phase 7).
+**Explicitly out of scope**: `Sleep`, `Now`, `NewID`, signals, `ContinueAsNew` behavior (schema only), in-process child optimization.
 
 ---
 
@@ -227,7 +234,7 @@ The phases are designed so that **each one ends with a runnable system**. If you
 **Key Deliverables**:
 - `ctx.Now()`, `ctx.NewID()` — recorded **per call** as synthetic call-log entries (`_now`, `_id`); replayed thereafter. (The v2 wording "recorded on first call within an attempt" was wrong — each call site gets its own deterministic value.) **Segment batching**: consecutive synthetic entries between real suspend points are written in one batch at the next durable write, so a loop calling `Now()` doesn't issue one Postgres write per iteration.
 - `ctx.Sleep(duration)` — records `_sleep` with `wake_at`; suspends; coordinator timer sweep (index on `wake_at`, poll every second) re-enqueues due activities. Multi-day sleeps cost no worker resources.
-- `SignalBus` interface in `internal/signal/` + Postgres impl (`signals` mailbox table + `NOTIFY`). Substrate fully abstracted; JetStream alternative is Phase 7.
+- `SignalBus` interface in `internal/signal/` + Postgres impl (`signals` mailbox table + `NOTIFY`). Substrate remains abstracted; alternatives require Phase 9 performance evidence.
 - `ctx.AwaitSignal(name, timeout)` — records `_await_signal`; suspends; coordinator delivers from the mailbox or fires the timeout. Delivery + call-log record in one transaction (a signal is consumed exactly once by a given call index; redelivery on replay returns the recorded payload).
 - **Signal sender dedupe**: `POST /activities/{id}:signal` accepts an `Idempotency-Key`; the `signals` table gets a `(activity_id, dedupe_key)` unique constraint. Engine semantics stay at-least-once, but the common client-retry double-delivery is eliminated at the door.
 - **`ctx.ContinueAsNew(input)` (G5)**: atomically — mark current execution `COMPLETED(continued_as_new)`, increment `execution_seq`, start a successor execution with fresh call log and the supplied input. External identity is preserved: same `activity_id`, signals continue to route, pending undelivered signals carry over to the successor, composition links (`parent_activity_id`, `root_activity_id`) are retained. Replay cost is now bounded by the current execution's call count regardless of activity lifetime. Version pin re-evaluates at the boundary (a `ContinueAsNew` is the sanctioned point to pick up new code).
@@ -246,7 +253,7 @@ The phases are designed so that **each one ends with a runnable system**. If you
 
 **Explicitly out of scope**: JetStream `SignalBus`, determinism linter, coordinator HA. Phase 4 relies on author discipline plus the Phase 3 runtime guards.
 
-**Stop point for prototype use**: the execution model is complete and correct here. Phases 5–7 are productionization.
+**Stop point for prototype use**: the execution model is complete and correct here. Phases 5–9 turn it into an operable, then production-qualified system.
 
 ---
 
@@ -254,20 +261,25 @@ The phases are designed so that **each one ends with a runnable system**. If you
 
 **Goal**: The engine is safely consumable by untrusted tenants and operable by humans: complete API, auth, isolation, fairness, and the tooling to deploy new activity code without stranding suspended work. Guide: [impl/PHASE_5_API_TENANCY.md](platform/impl/PHASE_5_API_TENANCY.md).
 
-**Duration**: 3 weeks (solo)
+**Duration**: 4 weeks (solo)
 
 **Key Deliverables**:
 - **Complete REST API** per [API_SPEC.md](platform/API_SPEC.md) / [niyanta-v1.yaml](../api/openapi/niyanta-v1.yaml), closing the contract gaps:
   - `POST /activities/{id}:pause` and `:resume` (the `PAUSED` state finally has operations that produce it).
-  - **Long-poll wait**: `GET /activities/{id}?wait=30s` returns early on terminal state — the most common client interaction stops being a poll loop. (SSE stream endpoint reserved for Phase 6 console.)
-  - **Operator recovery endpoints (G6)**: `POST /activities/{id}:force-fail`, `:force-complete` (operator-supplied result), and `:truncate-replay` (drop the call-log suffix from the divergent index, guarded by a `confirm` token + audit event) — the documented escape hatches for nondeterminism poisoning.
-  - Attempts, call-log, and signal-mailbox read endpoints (the console's data source, also useful for debugging via `curl`).
-  - Executions chain endpoint for `ContinueAsNew` history.
-- **Auth + tenancy**: API-key auth (hashed at rest), customer extraction middleware, every query tenant-filtered at the storage boundary; contract tests assert cross-tenant reads return `NOT_FOUND`, not `FORBIDDEN` (no existence leaks).
+  - **Long-poll wait**: `GET /activities/{id}?wait=30s` returns early on terminal state.
+  - **Operator recovery endpoints (G6)**: `force-fail`, `force-complete`, and guarded `truncate-replay`.
+  - Cursor-paged attempts, calls, signals, executions, audit, workers, versions, leases, and composition-tree reads.
+  - Activity filters required by the console: status, type, tenant (admin only), version pin, condition, root, and created/updated time range.
+  - Cluster summary, version inventory/drain progress, worker drain, and `retry-now` contracts.
+- **One state boundary**: the console and CLIs use the versioned API only; they never read or mutate core Postgres tables directly. Storage migrations remain private implementation details.
+- **Auth + tenancy**: hashed API keys for service clients; principal, tenant, and capability extraction middleware; every query tenant-filtered at the storage boundary. Cross-tenant reads return `NOT_FOUND`. Phase 5 defines capabilities (`activity:read`, `payload:read`, `activity:operate`, `activity:recover`, `worker:drain`, `tenant:admin`) so Phase 7 does not invent authorization in the UI.
+- **Safe mutation contract**: every mutating endpoint requires `Idempotency-Key`, `expected_generation` (or `If-Match` resource version), and an operator reason where privileged. Stale state returns `409 CONFLICT` with current metadata. Destructive recovery endpoints provide a preview and short-lived server-issued confirmation token.
+- **Transactional privileged audit**: the mutation and its audit row commit in the same database transaction. Async audit remains permitted only for non-authoritative telemetry.
+- **Sensitive data policy**: metadata reads and payload reads are separate capabilities. Inputs, results, signals, checkpoints, and logs are redacted server-side by default, size-bounded, and never made safe solely by frontend masking.
 - **Fairness + protection**: priority scheduling with tier weights and aging (no activity starves > 30 minutes); per-tenant token-bucket rate limits; queue-depth backpressure (503 + `Retry-After`); per-tenant concurrency caps enforced by the scheduler.
 - **Deployment safety (G1 tooling)**: `niyanta versions list` (which pinned versions have live activities, counts by state), `niyanta versions drain <type>@<version>` (stop new pins, report until zero), and a `no_compatible_worker` alert condition — operators can retire old worker versions with evidence instead of hope.
 - Idempotent submission (`Idempotency-Key`) with a documented retention window for `idempotency_keys` + cleanup job.
-- Structured logging (zerolog or zap) with correlation IDs across activity → attempt → call; audit events written async (channel + writer goroutine) so audit never blocks the hot path.
+- Structured logging (zerolog or zap) with correlation IDs across activity → attempt → call.
 - Doc updates: OpenAPI regenerated as the single source of truth; signal route unified (`:signal`, matching the spec — the v2 plan's `/signals/{name}` variant dropped).
 
 **Success Criteria**:
@@ -277,72 +289,105 @@ The phases are designed so that **each one ends with a runnable system**. If you
 - Rate-limit and backpressure paths return correct codes and `Retry-After`.
 - **Poison-recovery drill**: deliberately break determinism in a running activity → it fails with `nondeterminism`, is not retried; operator truncates replay via the API; activity resumes and completes; audit trail shows the intervention.
 - **Drain drill**: activities pinned to `1.0.0`; run `versions drain`; pins complete or continue-as-new onto `1.1.0`; old workers removed with zero parked activities.
+- Race drill: two operators mutate the same generation; one succeeds and the other gets a conflict. Retrying the winner's idempotency key does not repeat the action.
+- A committed recovery or drain action always has its audit row after a forced process crash.
+- OpenAPI contract tests cover every Phase 6–7 user journey; the generated TypeScript client is built in CI.
 
 **Explicitly out of scope**: the web console (Phase 6 consumes this API), coordinator HA, autoscaling.
 
 ---
 
-### Phase 6: Activity Manager console + integrated observability
+### Phase 6: Read-only Activity Manager console
 
-**Goal**: A human can operate the engine from a browser: find any activity, understand exactly where it is (attempts, call log, composition tree, signals), act on it, and see cluster and workload health. Observability is **integrated**: the console ships its own metrics pipeline and is fully functional with zero external observability infrastructure, while staying Prometheus-compatible end to end. Guide: [impl/PHASE_6_CONSOLE_OBSERVABILITY.md](platform/impl/PHASE_6_CONSOLE_OBSERVABILITY.md).
+**Goal**: A human can find an activity and explain its state from a browser without adding a privileged mutation path. Guide: [impl/PHASE_6_CONSOLE_READ_ONLY.md](platform/impl/PHASE_6_CONSOLE_READ_ONLY.md).
+
+**Duration**: 3 weeks (solo)
+
+- React + TypeScript SPA generated against the Phase 5 OpenAPI client and embedded with `go:embed`; no CDN assets.
+- Console backend is a browser-facing adapter to the coordinator API. It owns browser sessions and preferences only; it has no credentials for core Postgres.
+- Read-only views: cluster summary, activity search, activity detail, paged attempt/call/replay timeline, progressively loaded composition tree, signal/heartbeat metadata, execution chain, workers, versions, and audit history.
+- Payloads are collapsed and redacted by default; revealing them requires `payload:read`, is server-side enforced, and emits a sensitive-read audit event.
+- Large collections are cursor-paged or virtualized. Composition children load on demand; the browser never downloads an unbounded tree/log/result.
+- Baseline UX quality: responsive layout, keyboard navigation, WCAG 2.2 AA automated checks, empty/error/loading states, and no raw HTML rendering from activity data.
+
+**Success Criteria**:
+- Find a suspended activity and identify its exact call index and wait reason in under one minute.
+- A 10,000-node composition is navigable through progressive loading without freezing the browser or issuing an unbounded query.
+- A principal without `payload:read` cannot obtain payloads by UI, direct API call, or export; a permitted reveal is audited.
+- Cross-tenant list, detail, audit, and saved-filter access fails without existence leakage.
+- The console binary works air-gapped and passes keyboard and automated accessibility checks.
+
+**Explicitly out of scope**: operator mutations, SSE, embedded metrics storage, coordinator HA.
+
+---
+
+### Phase 7: Operator workflows + live updates
+
+**Goal**: Authorized humans can safely change engine state from a browser, and watched resources converge after disconnects. Guide: [impl/PHASE_7_CONSOLE_OPERATIONS.md](platform/impl/PHASE_7_CONSOLE_OPERATIONS.md).
 
 **Duration**: 3 weeks (solo)
 
 **Key Deliverables**:
-
-**Metrics exposition (Prometheus-compatible)** — lands first:
-- `/metrics` on coordinator and workers. Engine metric set per [ARCHITECTURE.md](platform/ARCHITECTURE.md): activities by `{customer, activity_type, status}`; attempt outcomes; scheduler queue depth and age by priority; dispatch latency histogram; replay duration histogram and replayed-call counts; timer-sweep lag; signal delivery counts and mailbox depth; worker capacity/utilization; fenced-write counter (G3 — a nonzero rate is a redistribution event trail); `no_compatible_worker` parked-activity gauge (G1); nondeterminism-failure counter (G6).
-- **Shippable alert rules** (`deploy/prometheus/alerts.yaml`, standard Prometheus rule format): leader absent, dispatch latency SLO breach, dead-worker rate, parked-on-version activities > 0 for > 15m, nondeterminism failures > 0, queue starvation, timer-sweep lag, DB pool saturation. Evaluated by the console's integrated store out of the box; loadable into an external Prometheus unchanged.
-- **Grafana dashboards as code** (`deploy/grafana/*.json`) for teams that prefer Grafana for deep dives — optional; the console is sufficient on its own.
-- OpenTelemetry tracing: span per submission → schedule → attempt → each `RunChild`/`Sleep`/`AwaitSignal` → completion; trace context propagated through `ActivityContext`; exemplars linked from latency histograms.
-
-**Activity Manager console** (`cmd/console/`, or served by coordinator followers):
-- **Architecture**: Go backend that (a) serves the engine's read API + operator actions with RBAC (viewer / operator / admin roles on top of Phase 5 auth), (b) runs an **integrated metrics store** — an embedded scraper + local TSDB (Prometheus TSDB library, bounded retention, 15 days default) that scrapes coordinator/worker `/metrics` itself and answers PromQL for charts, hot lists, and alert evaluation with **no external Prometheus deployed**; if an external Prometheus URL is configured, the console federates to it instead (same queries, same charts, no code-path divergence), (c) streams live updates over SSE. Frontend: React + TypeScript SPA embedded via `go:embed` — single static binary, no separate deploy, works air-gapped (no CDN assets).
-- **Views**:
-  - **Cluster dashboard**: coordinator leader + health, worker fleet (status, capacity, versions, last heartbeat, in-flight counts), queue depths and ages, live throughput/error sparklines (Prometheus-backed), active alerts.
-  - **Activities**: search/filter by status, type, tenant, version pin, time range, root; saved filters for the operational hot lists — parked on version (G1), nondeterminism failures (G6), starving, lease-expiring.
-  - **Activity detail** — the flagship view: status + timings; **attempt timeline** (every physical attempt with worker, generation, error, duration); **call-log / replay timeline** (each `RunChild`/`Sleep`/`AwaitSignal`/`_now`/`_id` entry with completion state and recorded result — for a suspended activity this *is* "exactly where is it"); **composition tree** (parent/children graph, navigable); signal mailbox (pending + delivered); heartbeat state (for leaf activities); `ContinueAsNew` execution chain; linked trace.
-  - **Workers detail**: per-worker in-flight activities, capability/version set, lease table, drain button.
-  - **Versions**: pinned-version inventory and drain progress (the Phase 5 tooling, visualized).
-- **Operator actions** (RBAC-gated, every action writes an audit event, destructive ones require typed confirmation): cancel, pause/resume, send signal, retry-now, force-fail, force-complete, truncate-replay, worker drain.
-- **Live behavior**: SSE-driven updates on dashboards and detail views (no manual refresh while watching an activity resume).
-- docker-compose: postgres + coordinator + 2 workers + console — one command to a fully observable local cluster with **no other observability services**; an extended profile adds prometheus + grafana + jaeger to exercise the external-stack path.
+- OIDC for browser login where available; a documented local-admin/session mode for air-gapped installations. API keys remain service credentials and are never stored in browser local storage.
+- Secure server-side sessions: `HttpOnly`, `Secure`, `SameSite` cookies; CSRF tokens on mutations; CSP, frame, and content-type headers; logout and session revocation.
+- Capability-gated actions: cancel, pause/resume, signal, retry-now, force-fail, force-complete, truncate replay, and worker/version drain. Recovery capabilities are distinct from routine operation.
+- Each action shows target, current generation, expected effect, reason, and preview. The server enforces generation/version checks, idempotency, and transactional audit. Typed confirmation is additional friction, not the concurrency mechanism.
+- SSE contract: tenant-scoped endpoint, monotonic event IDs, heartbeat frames, bounded replay window, `Last-Event-ID`, slow-client limits, and proxy-safe headers. Events are invalidations; after reconnect or a sequence gap the UI refetches authoritative state.
+- Saved filters/preferences live in a separate console schema or local config and never in engine core tables.
 
 **Success Criteria**:
-- **Zero-infra observability**: with nothing deployed beyond engine + console, the console renders throughput, latency, queue, and replay charts from its integrated store, and the shipped alert rules evaluate and fire in a staged failure (leader stop, queue starvation).
-- **External-stack parity**: pointed at an external Prometheus, the console shows the same charts and hot lists with no behavioral difference.
-- From a browser: find a suspended activity, see which call index it is parked on and what it's waiting for, send it a signal, watch it resume live.
-- Composition tree renders a 3-level parent/child pipeline correctly, with per-node status.
-- Kill a worker: cluster dashboard shows it dead within the heartbeat timeout, the redistribution is visible on the affected activity's attempt timeline, and the fenced-write counter ticks when the stale worker returns.
-- The G1/G6 hot lists work: a parked-on-version activity and a nondeterminism failure each appear in their saved filter, and the recovery drill from Phase 5 can be executed entirely from the UI, leaving an audit trail.
-- Console binary serves the SPA with no external network dependency; viewer role cannot see action buttons; operator actions are audited.
-
-**Explicitly out of scope**: coordinator HA, autoscaling, JetStream, multi-cluster console.
+- Viewer, operator, recovery operator, and tenant admin capabilities are enforced by the API, not button visibility.
+- Two operators acting on one generation produce one commit and one explicit conflict; no silent overwrite.
+- Kill the console after an action commits: the corresponding audit row exists after restart.
+- Disconnect an SSE client beyond the replay window: reconnect detects the gap, refetches, and converges.
+- Cross-tenant SSE subscriptions and guessed resource IDs disclose nothing.
 
 ---
 
-### Phase 7: HA, scale, hardening
+### Phase 8: Observability distribution
 
-**Goal**: Coordinator HA, optional broker substrates, determinism lint, chaos testing, scale to the targets in [ARCHITECTURE.md](platform/ARCHITECTURE.md) §Performance Targets. Guide: [impl/PHASE_7_HA_SCALE_HARDENING.md](platform/impl/PHASE_7_HA_SCALE_HARDENING.md).
+**Goal**: Operators can measure and alert on engine health without making the console a second mandatory stateful control-plane dependency. Guide: [impl/PHASE_8_OBSERVABILITY.md](platform/impl/PHASE_8_OBSERVABILITY.md).
 
-**Duration**: open-ended; tackle items selectively based on actual scale needs.
+**Duration**: 3 weeks (solo)
 
 **Key Deliverables**:
-- Coordinator HA via `LeaderElector` (pick one: Postgres advisory lock *or* etcd; align docs). Followers serve API + console; leader runs scheduler, health monitor, timer sweep, signal listener. Generation tokens already prevent split-brain (Phase 1/2); HA failover tests prove it under leader churn.
-- **Optional NATS JetStream substrates** behind the existing interfaces: `SignalBus` (removes the LISTEN/NOTIFY single-listener constraint) and/or `TaskQueue` — adopted only if measured Postgres dispatch throughput demands it. This is where the broker enters the system, if ever.
-- **Determinism linter (G2/ADR-005)**: static analysis flagging `time.Now()`, `rand.*`, map iteration ordering dependence, goroutine spawns, direct I/O, and `Heartbeat`/`LastHeartbeat` in any activity that uses suspend points. CI-enforced.
-- **Sticky-worker replay optimization**: prefer resuming a parent on the worker that last held it, with a bounded in-memory replay cache — cuts the per-suspend-point scheduler round-trip for hot compositions. (The suspend-and-free path remains the durable fallback; correctness never depends on stickiness.)
-- Chaos testing: random worker kills, leader kills, Postgres pauses/failovers, dropped notifications. Verify: no lost activities, exactly-once child dispatch holds, fencing holds, signal delivery within SLO.
-- Performance: load test to targets — and the meaningful load metric is **state transitions/sec** (each suspend point is several transactions), not concurrent-activity count. Profile; index per real query patterns; document the engine's throughput envelope as part of its contract.
-- Heartbeat/result blob offload via a `BlobStore` interface (S3) for payloads above threshold, pointer in Postgres.
-- Read replicas for console/list/audit queries at scale.
+- Prometheus `/metrics` on coordinator and workers with a cardinality budget. Per-tenant hot lists come from authorized state APIs; raw customer IDs are not unbounded metric labels by default.
+- Metrics for attempt outcomes, queue depth/age by bounded priority class, dispatch/replay/timer latency, worker capacity, fenced writes, parked versions, nondeterminism, and DB pools. Histogram buckets and label limits are load-tested.
+- Standard Prometheus alert rules and Grafana dashboards as code. The console can query a configured Prometheus URL for charts, but state inspection remains usable without Prometheus.
+- OpenTelemetry spans and trace links. The UI displays trace links only when a trace backend is configured; tracing is not falsely advertised as zero-infrastructure.
+- Optional embedded metrics profile only if justified by user need. It is explicitly single-console, non-HA, bounded by bytes and time, and documents persistent volume, WAL recovery, disk-full degradation, scrape discovery, query limits, and upgrade compatibility. Metrics failure must not affect execution.
 
 **Success Criteria**:
-- Kill the leader: failover < 30s, no activity progress lost, no duplicate child dispatch.
-- Sustained 1,000 activities/min for 24h with zero correctness errors; transition throughput envelope published.
-- Determinism lint catches a deliberately-broken activity in CI.
-- 1-hour chaos run: system recovers within SLO; call-log invariants verified post-run by an integrity checker (every completed call has exactly one child; no orphan children).
-- HPA (K8s) scales workers on queue-depth metric up and down.
+- A staged leader/worker/queue failure fires the shipped rules in external Prometheus.
+- Cardinality and query load stay within the published budget under the Phase 9 load shape.
+- Tenant-scoped charts cannot expose another tenant's identifiers or series.
+- Prometheus or the optional local metrics store can be unavailable or disk-full while activity execution and state inspection continue.
+- If the embedded profile ships, crash/WAL recovery and version upgrade tests pass; otherwise it remains explicitly deferred.
+
+---
+
+### Phase 9: Production hardening gate
+
+**Goal**: Qualify the engine's durability and operational claims for production. Guide: [impl/PHASE_9_PRODUCTION_HARDENING.md](platform/impl/PHASE_9_PRODUCTION_HARDENING.md).
+
+**Duration**: 4+ weeks (solo); exits on evidence, not schedule.
+
+**Key Deliverables**:
+- Coordinator HA using Postgres advisory-lock leadership unless testing proves it inadequate; followers serve API, while only the leader schedules, sweeps timers, and monitors health.
+- Backup and point-in-time restore runbook plus automated restore drill for Postgres; recovery-point and recovery-time results published.
+- Chaos: leader and worker kills, Postgres pauses/failover, dropped notifications, console loss, and stale workers. Post-run integrity checker validates dispatch, fencing, signals, and child linkage.
+- Security gate: threat model, dependency/container scanning, authorization matrix tests, secret/redaction tests, session/CSRF/CSP validation, and least-privilege database/network roles.
+- Upgrade/rollback tests across supported database schema and coordinator/worker/console version skews.
+- Load and soak tests in state transitions/sec and API/console query concurrency. Publish the supported envelope and size Postgres pools, indexes, pagination, and read replicas from evidence.
+- Determinism linter in CI; backup/restore, incident, version-drain, and rollback runbooks.
+
+**Success Criteria**:
+- Leader kill fails over within the stated SLO with no lost progress or duplicate child dispatch.
+- Restore drill meets the published RPO/RTO and the integrity checker passes on restored state.
+- A 24-hour representative soak and a one-hour chaos run complete with zero invariant violations.
+- Cross-tenant, privilege-escalation, payload-redaction, and SSE authorization suites pass.
+- One-version upgrade and rollback succeed with live suspended activities.
+- Production capacity and operational limits are published; unsupported scale is rejected or backpressured, not guessed.
 
 ---
 
@@ -353,12 +398,14 @@ Rewritten for v3 — the v2 table predated the activity model and carried stale 
 | Risk | Impact | Probability | Mitigation |
 |------|--------|-------------|------------|
 | **Replay semantics subtly wrong** (the engine's core) | Critical | Medium | Docs-before-code for Phases 3–4; failing tests first; integrity checker in chaos runs; exactly-once dispatch asserted by counting, not observing |
-| Version pinning gaps strand suspended activities | High | Medium | `no_compatible_worker` gauge + alert from Phase 3; drain tooling Phase 5; console hot list Phase 6 |
-| Postgres becomes the throughput ceiling (transitions/sec) | High | Medium | Measure transitions/sec from Phase 3; segment batching; sticky-worker cache and JetStream substrates staged in Phase 7 |
+| Version pinning gaps strand suspended activities | High | Medium | `no_compatible_worker` condition from Phase 3; drain tooling Phase 5; console hot list Phase 6; alert Phase 8 |
+| Postgres becomes the throughput ceiling (transitions/sec) | High | Medium | Measure from Phase 3; segment batching; Phase 9 capacity envelope; add a broker/read replica only from measured evidence |
 | Fencing regression in a new store method | High | Low | Fencing lives in the shared storage contract-test suite — every impl, every method, forever |
 | Unbounded call logs before `ContinueAsNew` lands | Medium | Low | Schema groundwork in Phase 3; sample long-lived activities use it from Phase 4; replay-duration histogram alerts |
-| Console scope creep delays engine hardening | Medium | Medium | Console is read-API + Prometheus proxy only; no console-private state beyond RBAC/saved filters |
-| Solo-execution estimate slip | Medium | High | Every phase ends runnable; stop points at 4 and 6 are real products |
+| Privileged UI action lands without durable audit or stale-state protection | High | Medium | Capability checks, expected generation, idempotency, and audit in the same transaction in Phase 5; exercised in Phase 7 |
+| Payloads or metrics leak tenant data | Critical | Medium | Separate `payload:read`, server redaction, sensitive-read audit, bounded metric labels, cross-tenant API/SSE/metrics suites |
+| Console scope creep delays hardening | Medium | High | Read-only, operations, and observability are separate phases; embedded TSDB is optional and cannot gate engine operation |
+| Solo-execution estimate slip | Medium | High | Every phase ends runnable; production is evidence-gated at Phase 9 rather than declared by calendar |
 
 ---
 
@@ -370,8 +417,10 @@ Cross-phase quality bars (per-phase criteria live in each phase narrative):
 - **After Phase 3**: children dispatched exactly once across arbitrary parent kills; replay short-circuit in microseconds per logged call; code redeploys never manufacture determinism violations (pinning); violations that do occur are non-retried and inspectable.
 - **After Phase 4 (model complete)**: unbounded-lifetime activity with bounded replay via `ContinueAsNew`; signals durable across total worker loss; cancellation leaves no orphaned children.
 - **After Phase 5**: API p95 < 200ms; tenant isolation with no existence leaks; nothing starves > 30 min; poison-recovery and version-drain drills executable via API alone.
-- **After Phase 6 (production engine)**: any activity's exact position explainable from the console in < 1 minute; every operator action audited; alert rules cover leader, starvation, parked versions, nondeterminism, fencing anomalies.
-- **After Phase 7**: leader failover < 30s with zero duplicate dispatch; 24h sustained load clean; published transition-throughput envelope.
+- **After Phase 6**: any activity's exact position explainable from the read-only console in < 1 minute; large histories remain bounded in API and browser memory.
+- **After Phase 7**: every privileged action is authorized, concurrency-safe, idempotent, and transactionally audited; SSE reconnects converge.
+- **After Phase 8 (operational beta)**: alert rules cover leader, starvation, parked versions, nondeterminism, fencing, and DB health within a published cardinality budget.
+- **After Phase 9 (production gate)**: leader failover, restore, upgrade/rollback, security, 24h load, and chaos suites pass with a published capacity envelope.
 
 ---
 
@@ -387,9 +436,11 @@ Week 2-3:    [Phase 1: Postgres + retries + write fencing]
 Week 4-5:    [Phase 2: coordinator/workers + Postgres dispatch + affinity]
 Week 6-9:    [Phase 3: RunChild + replay + version pinning + G4/G6]
 Week 10-13:  [Phase 4: Sleep/Now/NewID + signals + ContinueAsNew]   ← model complete
-Week 14-16:  [Phase 5: full API + auth + tenancy + drain tooling]
-Week 17-19:  [Phase 6: Activity Manager console + Prometheus stack] ← production engine
-Week 20+:    [Phase 7: HA + JetStream option + lint + chaos + scale]
+Week 14-17:  [Phase 5: operator API + auth + tenancy + safe mutations]
+Week 18-20:  [Phase 6: read-only Activity Manager]
+Week 21-23:  [Phase 7: operator workflows + SSE]
+Week 24-26:  [Phase 8: metrics + alerts + tracing]                 ← operational beta
+Week 27-30+: [Phase 9: HA + restore + security + chaos + scale]    ← production gate
 ```
 
 ### Key Milestones
@@ -402,12 +453,14 @@ Week 20+:    [Phase 7: HA + JetStream option + lint + chaos + scale]
 | **M3**: Composable | Phase 3 | Exactly-once `RunChild`; version-safe replay; violation recovery path |
 | **M4**: Model complete | Phase 4 | Timers, signals, `ContinueAsNew`, cancellation semantics |
 | **M5**: Consumable | Phase 5 | Complete API, multi-tenant, fair, deploy-safe |
-| **M6**: Operable | Phase 6 | Console + cluster view + Prometheus observability |
-| **M7**: Hardened | Phase 7 | HA, scale targets met, chaos-proven |
+| **M6**: Inspectable | Phase 6 | Read-only console explains activity and cluster state |
+| **M7**: Operable | Phase 7 | Safe browser actions and reconnectable live updates |
+| **M8**: Observable beta | Phase 8 | Metrics, alerts, dashboards, and tracing with bounded cardinality |
+| **M9**: Production-qualified | Phase 9 | HA, restore, security, upgrade, load, and chaos evidence |
 
 ---
 
-## Post-Phase 7 Roadmap
+## Post-Phase 9 Roadmap
 
 Items not on the engine's critical path. Pick up as needed.
 
@@ -419,6 +472,9 @@ Items not on the engine's critical path. Pick up as needed.
 - Multi-cluster console federation.
 - Billing and usage tracking; self-service tenant dashboard.
 - Marketplace for third-party activity types.
+- Optional JetStream task/signal substrates, only if the published Postgres envelope is insufficient.
+- Optional embedded Prometheus-compatible metrics profile, if Phase 8 user evidence justifies its lifecycle cost.
+- Sticky-worker replay cache and blob offload, when profiling shows they are needed.
 
 Application compositions (ingestion platforms, agentic operations, anything else) are separate products with separate plans; they consume the engine API/SDK and never appear on this roadmap.
 
@@ -432,17 +488,17 @@ Application compositions (ingestion platforms, agentic operations, anything else
 |-----------|-----------|-----------|
 | Language | Go 1.22+ | Performance, concurrency, ecosystem |
 | API framework | stdlib `net/http` + chi (or Echo) | Small surface; the API is not the hard part |
-| Database | PostgreSQL 15+ | ACID, `SKIP LOCKED`, `LISTEN/NOTIFY`, JSONB — the only required external dependency through Phase 6 |
-| Dispatch/broker | Postgres-native (P2); NATS JetStream optional (P7) | Minimal dependencies; interfaces allow substitution |
+| Database | PostgreSQL 15+ | ACID, `SKIP LOCKED`, `LISTEN/NOTIFY`, JSONB — the engine's required stateful dependency |
+| Dispatch/broker | Postgres-native (P2); NATS JetStream post-P9 if measured | Minimal dependencies; interfaces allow substitution |
 | Console frontend | React + TypeScript, `go:embed` | Single static binary, air-gap friendly |
 | Live updates | SSE | Simpler than websockets for one-way streams |
 | Logging | Zerolog or Zap | Structured, high-performance |
-| Metrics | Prometheus exposition + embedded TSDB in console | Integrated out of the box; PromQL-compatible; external Prometheus optional via federation |
-| Dashboards/alerts | Console built-in + Prometheus rule files (+ optional Grafana JSON), as code in `deploy/` | Reviewable, versioned observability that works with zero extra infra |
+| Metrics | Prometheus exposition; external Prometheus production default | Avoids making the console a mandatory stateful monitoring system; embedded profile is optional |
+| Dashboards/alerts | Console charts + Prometheus rules + Grafana JSON in `deploy/` | Reviewable, versioned observability; state hot lists come from the API |
 | Tracing | OpenTelemetry → Jaeger/Tempo | Exemplar-linked from histograms |
 | Migrations | golang-migrate | Versioned up/down pairs |
 | Deployment | docker-compose (dev), Kubernetes (prod) | Portable |
-| CI/CD | GitHub Actions | Includes determinism lint (P7) |
+| CI/CD | GitHub Actions | Includes determinism lint and security/contract suites by P9 |
 
 ### B. Required follow-up doc edits (tracked)
 
@@ -452,6 +508,8 @@ Application compositions (ingestion platforms, agentic operations, anything else
 | DATA_MODELS.md | Attempt-status enum; checkpoint unique key; lease on attempt; fencing invariant in transaction boundaries; `execution_seq`/`superseded_by`; signal dedupe key; payload caps | P1–P4 |
 | ARCHITECTURE.md | State diagram gains `SUSPENDED`/`FAILED`; broker section rewritten for Postgres-native dispatch with JetStream as P7 option; app-composition sections move to their own docs | P2 |
 | niyanta-v1.yaml | pause/resume, wait param, recovery endpoints, executions chain, call-log/mailbox reads, signal idempotency header | P5 |
+| API_SPEC.md / niyanta-v1.yaml | console filters, composition/cluster/version/lease reads, action preconditions, capabilities, SSE contract | P5–P7 |
+| ARCHITECTURE.md | console uses API only; browser/session boundary; external Prometheus default; production gate | P6–P9 |
 
 ---
 
@@ -474,6 +532,7 @@ Application compositions (ingestion platforms, agentic operations, anything else
 | 2.1 | 2026-05-01 | Recentered product framing around self-orchestrated ingestion. |
 | 2.2 | 2026-05-03 | Split connector ecosystem breadth into Phases 5A/5B. |
 | 3.0 | 2026-07-06 | **Use-case-agnostic engine plan.** Removed all application phases (5/5A/5B connector, ingestion, LLMOps content). Scheduled six contract-gap resolutions: write-path fencing (P1/P2), version-pinned replay (P3), exactly-once child dispatch (P3), determinism-violation recovery (P3/P5), heartbeat×replay mutual exclusivity (P1/P3), `ContinueAsNew` history truncation (P4). Replaced NATS-based Phase 2 dispatch with Postgres-native pull dispatch; JetStream deferred to Phase 7 as optional substrate. Added API-completeness work (pause/resume, long-poll wait, recovery endpoints, signal dedupe) to Phase 5. Added Phase 6: Activity Manager console with cluster view, replay/attempt/composition visualizations, RBAC'd operator actions, and Prometheus-backed observability (metrics, alert rules, Grafana dashboards, OTel tracing). Former Phase 6 hardening renumbered to Phase 7 with sticky-worker replay optimization and transition-throughput load model. Risk table rewritten (top risk: replay correctness). |
+| 3.1 | 2026-07-10 | Grounded the control-panel delivery plan after critical review. Expanded Phase 5 with the operator API, capability model, mutation preconditions, transactional audit, and payload policy. Split the former Phase 6 into read-only console (P6), safe operator workflows/SSE (P7), and observability distribution (P8). Made external Prometheus the production default and any embedded store optional. Added a mandatory production hardening gate (P9) for HA, restore, security, upgrade/rollback, chaos, and capacity evidence. |
 
 ---
 

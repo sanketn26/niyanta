@@ -1,7 +1,7 @@
 # Platform Implementation Guides
 
 **Status**: Draft
-**Last Updated**: 2026-07-06
+**Last Updated**: 2026-07-10
 
 This folder contains phase-wise implementation details for Niyanta: a durable distributed activity execution engine. The engine is use-case agnostic — these guides never assume anything about what an activity does.
 
@@ -14,11 +14,13 @@ Read these in order. Each phase ends with a runnable system and builds directly 
 | 2 | [PHASE_2_DISTRIBUTED_WORKERS.md](PHASE_2_DISTRIBUTED_WORKERS.md) | Coordinator/worker split, Postgres-native dispatch, failure redistribution |
 | 3 | [PHASE_3_CHILD_ACTIVITIES_REPLAY.md](PHASE_3_CHILD_ACTIVITIES_REPLAY.md) | `RunChild`, durable suspend, replay resume, version pinning |
 | 4 | [PHASE_4_TIMERS_SIGNALS.md](PHASE_4_TIMERS_SIGNALS.md) | Durable sleep, deterministic primitives, signals, `ContinueAsNew` |
-| 5 | [PHASE_5_API_TENANCY.md](PHASE_5_API_TENANCY.md) | Complete REST API, auth, multi-tenancy, priority, version drain |
-| 6 | [PHASE_6_CONSOLE_OBSERVABILITY.md](PHASE_6_CONSOLE_OBSERVABILITY.md) | Activity Manager console with integrated cluster + Prometheus observability |
-| 7 | [PHASE_7_HA_SCALE_HARDENING.md](PHASE_7_HA_SCALE_HARDENING.md) | Coordinator HA, optional broker substrates, lint, chaos, scale |
+| 5 | [PHASE_5_API_TENANCY.md](PHASE_5_API_TENANCY.md) | Operator/read API, auth, safe mutations, multi-tenancy, priority, version drain |
+| 6 | [PHASE_6_CONSOLE_READ_ONLY.md](PHASE_6_CONSOLE_READ_ONLY.md) | Read-only Activity Manager for bounded, redacted state inspection |
+| 7 | [PHASE_7_CONSOLE_OPERATIONS.md](PHASE_7_CONSOLE_OPERATIONS.md) | Browser identity, safe operator workflows, reconnectable SSE |
+| 8 | [PHASE_8_OBSERVABILITY.md](PHASE_8_OBSERVABILITY.md) | Bounded Prometheus metrics, alerts, dashboards, tracing |
+| 9 | [PHASE_9_PRODUCTION_HARDENING.md](PHASE_9_PRODUCTION_HARDENING.md) | HA, restore, security, upgrade, chaos, capacity gate |
 
-By the end of Phase 4 the execution model is complete. Phase 5 makes the engine consumable, Phase 6 makes it operable, Phase 7 makes it hardened.
+By the end of Phase 4 the execution model is complete. Phase 5 makes the API consumable, Phase 6 makes state inspectable, Phase 7 makes browser operations safe, Phase 8 makes the system observable, and Phase 9 qualifies it for production.
 
 ## Project Layout
 
@@ -34,7 +36,7 @@ internal/
   api/
   audit/
   config/
-  console/            console backend: read API, metrics store, SSE (Phase 6)
+  console/            browser adapter: sessions/read UI (P6), actions/SSE (P7), charts (P8)
   executor/
   metrics/            Prometheus registry + collectors
   registry/

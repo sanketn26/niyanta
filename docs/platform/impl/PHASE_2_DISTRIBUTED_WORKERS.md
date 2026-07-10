@@ -2,7 +2,7 @@
 
 **Goal**: Split execution into a coordinator and many workers. Dispatch is **Postgres-native** — workers pull with `FOR UPDATE SKIP LOCKED`, woken by `LISTEN/NOTIFY`. Detect worker failure, redistribute attempts, and prove that a stale worker **cannot write** after redistribution.
 
-No broker. Postgres remains the only external dependency. The `TaskQueue`/`EventBus` interfaces stay, so a NATS JetStream implementation can drop in at Phase 7 if measured scale demands it.
+No broker. Postgres remains the only external dependency. The `TaskQueue`/`EventBus` interfaces stay so an alternative can be evaluated after the Phase 9 capacity envelope if measured scale demands it.
 
 ## Files To Add
 

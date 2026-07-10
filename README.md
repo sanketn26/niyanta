@@ -7,4 +7,4 @@ Start with:
 - [Getting started](docs/GETTING_STARTED.md)
 - [Documentation index](docs/README.md)
 - [Platform architecture](docs/platform/ARCHITECTURE.md) — the engine
-- [Implementation plan](docs/IMPLEMENTATION_PLAN.md) — phases 0–7, including the Activity Manager console with integrated observability
+- [Implementation plan](docs/IMPLEMENTATION_PLAN.md) — phases 0–9, including a staged Activity Manager console and mandatory production hardening gate

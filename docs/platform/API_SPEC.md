@@ -14,7 +14,7 @@
 5. [Error Handling](#error-handling)
 6. [Rate Limiting](#rate-limiting)
 7. [Pagination](#pagination)
-8. [WebSocket API (Optional)](#websocket-api-optional)
+8. [Server-Sent Events](#server-sent-events-phase-7)
 9. [API Versioning](#api-versioning)
 10. [OpenAPI Specification](#openapi-specification)
 11. [SDK Examples](#sdk-examples)
@@ -47,15 +47,19 @@ Authorization: Bearer <api_key>
 2. Verify key exists (table: `api_keys`), check expiration/status.
 3. Inject `customer_id` into request context — **all** queries filter by it at the storage boundary.
 
-### JWT Authentication (Phase 2)
+### Browser Authentication (Phase 7)
 
 ```
-Authorization: Bearer <jwt_token>
+OIDC Authorization Code + PKCE → server-side Niyanta session
 ```
 
 ```json
-{ "sub": "user_123", "customer_id": "cust_abc123", "tier": "premium", "exp": 1735308896, "iat": 1735305296 }
+{ "sub": "user_123", "customer_id": "cust_abc123", "capabilities": ["activity:read", "activity:operate"], "exp": 1735308896, "iat": 1735305296 }
 ```
+
+The console uses `HttpOnly`, `Secure`, `SameSite` session cookies and CSRF tokens for mutations. API keys are service credentials and are never stored in browser local storage. Air-gapped deployments may enable a documented local-admin/session provider.
+
+Authorization is capability-based and enforced by the API: `activity:read`, `payload:read`, `activity:operate`, `activity:recover`, `worker:drain`, and `tenant:admin`. Capabilities are tenant-scoped unless explicitly system-wide.
 
 ---
 
@@ -150,7 +154,7 @@ type ActivitySubmitRequest struct {
 
 **Endpoint**: `GET /activities`
 
-**Query Parameters**: `status`, `activity_type`, `parent_activity_id`, `root_activity_id`, `limit` (default 50, max 100), `cursor` (preferred) or `offset`, `order_by` (default `created_at`), `order` (`asc`|`desc`).
+**Query Parameters**: `status`, `activity_type`, `parent_activity_id`, `root_activity_id`, `pinned_version`, `condition`, `created_after`, `created_before`, `updated_after`, `updated_before`, admin-only `customer_id`, `limit` (default 50, max 100), `cursor`, `order_by` (default `created_at`), `order` (`asc`|`desc`). Cursor pagination is required for console collection views.
 
 **Example**: `GET /activities?status=RUNNING&activity_type=sample_pipeline&limit=20&order_by=priority&order=desc`
 
@@ -169,8 +173,11 @@ type ActivitySubmitRequest struct {
 | Pause | `POST /activities/{id}:pause` | Pauses at the next safe suspend point. |
 | Resume | `POST /activities/{id}:resume` | Resumes a paused activity. |
 | Signal | `POST /activities/{id}:signal` | Deliver an external event. Body: `{ "name": "...", "payload": { } }`. Accepts `Idempotency-Key` header — a retried send with the same key is one mailbox entry. |
+| Retry now | `POST /activities/{id}:retry-now` | Re-enqueues an eligible failed or delayed activity attempt. |
 
-**Response**: `200 OK` with the updated activity, or `409 INVALID_STATE` if the transition is not allowed.
+All mutations require `Idempotency-Key` and `If-Match` (resource version) or `expected_generation`. Privileged operations require an operator reason. A stale precondition or invalid transition returns `409` with current non-sensitive metadata.
+
+**Response**: `200 OK` with the updated activity, or `409 INVALID_STATE` / `409 CONFLICT`.
 
 **Operator recovery operations** (Phase 5; RBAC `operator`+, every call audited — the escape hatches for nondeterminism poisoning per ADR-005 G6):
 
@@ -178,7 +185,9 @@ type ActivitySubmitRequest struct {
 |-----------|----------|-------|
 | Force-fail | `POST /activities/{id}:force-fail` | Terminal `FAILED` with operator-supplied reason. |
 | Force-complete | `POST /activities/{id}:force-complete` | Terminal `COMPLETED` with operator-supplied `result_json`. |
-| Truncate replay | `POST /activities/{id}:truncate-replay` | Drops the call-log suffix from a divergent index and re-enqueues. Body: `{ "from_call_index": N, "confirm": "<token>" }`. |
+| Truncate replay | `POST /activities/{id}:truncate-replay` | Drops the call-log suffix from a divergent index and re-enqueues. Requires a preview-derived, short-lived confirmation token bound to principal, target, action, and generation. |
+
+Recovery and drain operations expose preview endpoints before execution. The mutation and authoritative audit row commit in the same database transaction.
 
 ---
 
@@ -224,6 +233,12 @@ The console's data sources; also `curl`-debuggable.
 | `GET /activities/{id}/calls` | The call log for the current execution: `call_index`, `call_type`, `args_hash`, `child_activity_id`, completion state, recorded result. For a suspended activity, the last incomplete entry *is* "where it is parked." |
 | `GET /activities/{id}/signals` | The signal mailbox: pending and delivered entries. |
 | `GET /activities/{id}/executions` | The `ContinueAsNew` chain: one entry per execution (`execution_seq`, input, result, call count, timings). |
+| `GET /activities/{id}/composition` | Cursor-paged direct parents/children plus aggregate counts; clients traverse lazily rather than requesting an unbounded recursive tree. |
+| `GET /cluster` | Bounded coordinator, queue, condition, and worker summary. |
+| `GET /versions` | Pinned-version inventory and drain progress. |
+| `GET /workers/{id}/leases` | Cursor-paged leases and in-flight activity metadata. |
+
+Payload-bearing fields are redacted by default. Revealing inputs, results, signals, checkpoints, errors, or logs requires `payload:read` and creates a sensitive-read audit event. Response and field size caps apply to all routes.
 
 ---
 
@@ -271,7 +286,7 @@ Requires an internal admin permission, not a customer key.
 | Endpoint | Purpose | Response |
 |----------|---------|----------|
 | `GET /health` | Liveness | `200 {"status":"ok"}` |
-| `GET /ready` | Readiness (DB reachable, leader known; broker included only if a Phase 7 substrate is configured) | `200`/`503` with dependency detail |
+| `GET /ready` | Readiness (DB reachable, leader known; optional substrates included only when configured) | `200`/`503` with dependency detail |
 | `GET /metrics` | Prometheus exposition | `text/plain` metrics |
 
 ```
@@ -488,15 +503,18 @@ GET /activities?limit=50&offset=100
 
 ---
 
-## WebSocket API (Optional)
+## Server-Sent Events (Phase 7)
 
-### Real-Time Activity Updates
+### Real-Time Invalidations
 
 ```
-wss://api.niyanta.example.com/v1/activities/{activity_id}/stream
-Authorization: Bearer <api_key>
+GET /v1/events?resource_kind=activity&resource_id=act_abc123
+Last-Event-ID: 829104
 ```
-Server pushes `ActivityStatusUpdate` frames on status change, child dispatch, suspend/resume, and completion.
+
+The tenant-scoped stream emits versioned envelopes containing monotonic `event_id`, `resource_kind`, `resource_id`, `resource_version`, `event_type`, and `timestamp`. It supports heartbeat frames, a bounded replay window, per-principal limits, and slow-client eviction.
+
+Events are invalidations, not authoritative state. Clients refetch affected resources. If `Last-Event-ID` is older than the replay window, the server reports a gap and the client performs full reconciliation. API keys may use SSE for service integrations; the browser console uses its authenticated session.
 
 ---
 

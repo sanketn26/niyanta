@@ -17,7 +17,7 @@ docs/
   README.md              index — update when adding/moving a doc
   GETTING_STARTED.md
   CONTRIBUTING_DOCS.md   (this file)
-  IMPLEMENTATION_PLAN.md roadmap (engine-only, phases 0–7)
+  IMPLEMENTATION_PLAN.md roadmap (engine-only, phases 0–9)
   platform/              ARCHITECTURE, DATA_MODELS, API_SPEC, adr/, impl/
 api/openapi/             machine-readable engine API (niyanta-v1.yaml)
 ```
@@ -38,7 +38,7 @@ The canonical activity model is [platform/adr/ADR-005-activity-execution-model.m
 
 There are two numbering schemes — don't conflate them:
 
-- **Delivery phases** 0–7 in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md), each with a guide in [platform/impl/](platform/impl/README.md).
+- **Delivery phases** 0–9 in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md), each with a guide in [platform/impl/](platform/impl/README.md).
 - **Engine capability milestones** M1–M4 in ADR-005, mapped to delivery phases in the ADR's cross-walk table.
 
 When you change phasing, update the ADR cross-walk, the plan, and the impl README together. The plan's phase numbers win.
